@@ -19,7 +19,8 @@ RUN pip install --no-cache-dir --use-deprecated=legacy-resolver -r olis_requirem
 
 # Static UI assets (app also works with a bind-mounted /app in compose)
 COPY index.html index.js index.css ./
-COPY original_flask_app/server.py ./
+COPY server.py ./
+COPY original_flask_app/ ./original_flask_app/
 
 
 # Set environment variables (can be overridden in docker-compose)
