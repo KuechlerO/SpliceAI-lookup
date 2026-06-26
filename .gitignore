@@ -2,6 +2,7 @@
 *.txt*
 *.tsv*
 *.json*
+*.chain.gz*
 
 service.backup_copy.yaml
 
@@ -21,6 +22,8 @@ service.backup_copy.yaml
 *.gtf.gz
 *.tbi
 *.crt
+
+.memory
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

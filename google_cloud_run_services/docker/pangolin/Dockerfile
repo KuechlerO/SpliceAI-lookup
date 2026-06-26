@@ -11,7 +11,11 @@ RUN apt update && apt-get install --no-install-recommends -y \
     liblzma-dev \
     zlib1g-dev
 
-RUN python3 -m pip install torch==2.2.1 -f https://download.pytorch.org/whl/torch_stable.html
+# Pull torch from PyTorch's CPU-only wheel index — the default PyPI wheel
+# bundles CUDA/cuDNN/cuBLAS (~2 GB on disk) that we never use on Cloud Run.
+# Important: this must come before the requirements.txt install below; if
+# pip first resolves torch from PyPI it will pick the GPU build.
+RUN python3 -m pip install torch==2.2.1 --index-url https://download.pytorch.org/whl/cpu
 
 RUN apt update && apt-get install --no-install-recommends -y build-essential libpq-dev
 
@@ -22,17 +26,33 @@ RUN git clone https://github.com/bw2/Pangolin.git \
     && cd Pangolin \
 	&& python3 -m pip install .
 
-ARG CONCURRENCY="2"
+ARG WORKERS="2"
 ARG GENOME_VERSION="unknown"
 
 COPY docker/ref/GRCh${GENOME_VERSION} /
 COPY docker/pangolin/annotations/GRCh${GENOME_VERSION} /
 COPY server.py /
+COPY sai10k_predictions.py /
+
+# Cap every CPU thread pool to 1 thread per worker. Without these, each gunicorn
+# worker's torch/OpenMP/BLAS pools default to the instance core count, so WORKERS workers
+# on a 2-CPU instance oversubscribe the CPUs by a large factor and a burst of cache-miss
+# inferences balloons past the 300s Cloud Run timeout (504). One thread per worker keeps
+# per-request CPU bounded; parallelism comes from WORKERS workers, not threads per worker.
+ENV OMP_NUM_THREADS=1
+ENV OPENBLAS_NUM_THREADS=1
+ENV MKL_NUM_THREADS=1
 
 ENV PORT=8080
 ENV TOOL=pangolin
 ENV GENOME_VERSION=${GENOME_VERSION}
-ENV CONCURRENCY=${CONCURRENCY}
+ENV WORKERS=${WORKERS}
 ENV RUNNING_ON_GOOGLE_CLOUD_RUN=1
 
-CMD exec gunicorn --preload --bind :$PORT --workers ${CONCURRENCY} --threads 1 --timeout 0 server:app
+# --timeout 870 (was 290, 120, 0): recycle a worker stuck >870s. Raised 290 -> 870 to match
+# spliceai (with Cloud Run's request timeout raised 300 -> 900 in build_and_deploy.py, so
+# gunicorn recycles first for a clean 500 rather than a platform 504) so heavy inferences
+# complete instead of being killed. Trade-off: a sync worker (1 of WORKERS) is tied up for
+# up to 870s on such a request, lowering the instance's effective concurrency while it runs.
+# --graceful-timeout gives in-flight requests 30s to finish on restart.
+CMD exec gunicorn --preload --bind :$PORT --workers ${WORKERS} --threads 1 --timeout 870 --graceful-timeout 30 server:app

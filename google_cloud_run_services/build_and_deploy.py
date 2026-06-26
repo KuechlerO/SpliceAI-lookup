@@ -1,19 +1,189 @@
 import argparse
 import logging
 import os
+import platform
 import time
 
+from dotenv import load_dotenv
 import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
 import re
+from tqdm import tqdm
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s: %(message)s")
 
 VALID_COMMANDS = {
-    "update_annotations", "build", "deploy", "test", "test2", "run",
+    "update_annotations", "update_transcript_tables", "build", "deploy", "test", "test2", "run",
 }
 
 GCLOUD_PROJECT = "spliceai-lookup-412920"
 DOCKERHUB_REPO = "docker.io/weisburd"
+
+DB_HOST = os.environ.get("SPLICEAI_LOOKUP_DB_HOST")
+if not DB_HOST:
+    raise ValueError("SPLICEAI_LOOKUP_DB_HOST not set. Please add it to .env file.")
+DB_NAME = "spliceai-lookup-db"
+DB_USER = "postgres"
+
+
+def get_db_connection():
+    """Get a database connection using password from .pgpass file."""
+    pgpass_path = os.path.join(os.path.dirname(__file__), ".pgpass")
+    if not os.path.exists(pgpass_path):
+        raise FileNotFoundError(f"Database password file not found: {pgpass_path}")
+
+    with open(pgpass_path, "r") as f:
+        password = f.read().strip()
+
+    return psycopg2.connect(
+        host=DB_HOST,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=password,
+    )
+
+
+def update_transcript_tables(genome_versions, gencode_version):
+    """Populate the transcripts table in the database from genePred files.
+
+    Args:
+        genome_versions: List of genome versions to process (e.g., ["37", "38"])
+        gencode_version: The gencode version string (e.g., "v49")
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    # Process each genome version
+    total_records = 0
+    for genome_version in genome_versions:
+        table_name = f"transcripts_hg{genome_version}"
+        temp_table_name = f"{table_name}_reloading"
+
+        # Create the temporary table for this genome version
+        logging.info(f"Creating {temp_table_name} table...")
+        cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+        cursor.execute(f"""
+            CREATE TABLE {temp_table_name} (
+                transcript_id VARCHAR(50) PRIMARY KEY,
+                chrom VARCHAR(25) NOT NULL,
+                strand VARCHAR(1) NOT NULL,
+                tx_start INTEGER NOT NULL,
+                tx_end INTEGER NOT NULL,
+                cds_start INTEGER,
+                cds_end INTEGER,
+                exon_count INTEGER NOT NULL,
+                exon_starts TEXT NOT NULL,
+                exon_ends TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        # Look for genePred files in the annotations directory
+        gene_pred_path = f"./docker/ref/GRCh{genome_version}/gencode.{gencode_version}.GRCh{genome_version}.sorted.txt.gz"
+
+        if not os.path.exists(gene_pred_path):
+            # Try alternate path patterns
+            alt_path = f"gencode.{gencode_version}.GRCh{genome_version}.sorted.txt.gz"
+            if os.path.exists(alt_path):
+                gene_pred_path = alt_path
+            else:
+                logging.warning(f"GenePred file not found: {gene_pred_path}")
+                continue
+
+        logging.info(f"Reading genePred file: {gene_pred_path}")
+
+        # genePred extended format columns
+        column_names = [
+            "name",        # transcript ID
+            "chrom",
+            "strand",
+            "txStart",     # 0-based
+            "txEnd",
+            "cdsStart",    # 0-based
+            "cdsEnd",
+            "exonCount",
+            "exonStarts",  # comma-separated, 0-based
+            "exonEnds",    # comma-separated
+            "score",
+            "name2",       # gene name
+            "cdsStartStat",
+            "cdsEndStat",
+            "exonFrames",  # comma-separated
+        ]
+
+        # The sorted file has an additional index column at the start
+        df = pd.read_table(gene_pred_path, names=["i"] + column_names)
+
+        # Prepare all rows for bulk insert
+        rows = []
+        for _, row in tqdm(df.iterrows(), total=len(df), desc=f"GRCh{genome_version}"):
+            transcript_id = row["name"].split(".")[0]  # Remove version suffix
+            cds_start = int(row["cdsStart"]) if pd.notna(row["cdsStart"]) else None
+            cds_end = int(row["cdsEnd"]) if pd.notna(row["cdsEnd"]) else None
+
+            # Check if CDS start equals CDS end (non-coding transcript)
+            if cds_start is not None and cds_end is not None and cds_start == cds_end:
+                cds_start = None
+                cds_end = None
+
+            rows.append((
+                transcript_id,
+                row["chrom"],
+                row["strand"],
+                int(row["txStart"]),
+                int(row["txEnd"]),
+                cds_start,
+                cds_end,
+                int(row["exonCount"]),
+                row["exonStarts"],
+                row["exonEnds"],
+            ))
+
+        # Bulk insert using execute_values (much faster than individual inserts)
+        batch_size = 1000
+        insert_sql = f"""INSERT INTO {temp_table_name}
+               (transcript_id, chrom, strand, tx_start, tx_end,
+                cds_start, cds_end, exon_count, exon_starts, exon_ends)
+               VALUES %s
+               ON CONFLICT (transcript_id) DO UPDATE SET
+                   chrom = EXCLUDED.chrom,
+                   strand = EXCLUDED.strand,
+                   tx_start = EXCLUDED.tx_start,
+                   tx_end = EXCLUDED.tx_end,
+                   cds_start = EXCLUDED.cds_start,
+                   cds_end = EXCLUDED.cds_end,
+                   exon_count = EXCLUDED.exon_count,
+                   exon_starts = EXCLUDED.exon_starts,
+                   exon_ends = EXCLUDED.exon_ends"""
+
+        for i in tqdm(range(0, len(rows), batch_size), desc=f"Inserting GRCh{genome_version}"):
+            batch = rows[i:i + batch_size]
+            execute_values(cursor, insert_sql, batch)
+
+        conn.commit()
+
+        # Create index on transcript_id for fast lookups
+        logging.info(f"Creating index on {temp_table_name}...")
+        cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{temp_table_name}_tid ON {temp_table_name} (transcript_id)")
+        conn.commit()
+
+        # Replace the old table with the new one
+        logging.info(f"Replacing {table_name} with new data...")
+        cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+        cursor.execute(f"ALTER TABLE {temp_table_name} RENAME TO {table_name}")
+        cursor.execute(f"ALTER INDEX IF EXISTS idx_{temp_table_name}_tid RENAME TO idx_{table_name}_tid")
+        conn.commit()
+
+        logging.info(f"Inserted {len(rows):,d} records into {table_name}")
+        total_records += len(rows)
+
+    cursor.close()
+    conn.close()
+
+    logging.info(f"Done! Inserted {total_records:,d} total transcript records into the database.")
+
 
 def get_service_name(tool, genome_version):
     return f"{tool}-{genome_version}"
@@ -44,6 +214,11 @@ def main():
                         "https://www.gencodegenes.org/human/. Either this or --gencode-version must be specified for "
                         "the 'update_annotations' command")
 
+    parser.add_argument("--dev", action="store_true",
+                        help="Deploy as a 'dev'-tagged revision with --no-traffic so production keeps "
+                             "serving the existing revision. Test against the tagged URL printed by "
+                             "gcloud, then promote with: "
+                             "gcloud run services update-traffic <service> --region us-central1 --to-tags dev=100")
     parser.add_argument("command", nargs="?", choices=VALID_COMMANDS,
                         help="Command to run. If not specified, it will run 'build' and then 'deploy'")
 
@@ -60,7 +235,7 @@ def main():
         tools = ["spliceai", "pangolin"]
 
     if args.gencode_version:
-        if not re.match("v[0-9][0-9]", args.gencode_version):
+        if not re.fullmatch(r"v\d+", args.gencode_version):
             parser.error("--gencode-version must be of the form 'v46'")
         gencode_version_number = int(args.gencode_version.lstrip("v"))
     else:
@@ -82,7 +257,9 @@ def main():
                         parser.error(f"Invalid genome version: {genome_version}")
 
                     run(f"wget -nc {gencode_gtf_url}")
-                    run(f"wget -nc https://hgdownload.soe.ucsc.edu/admin/exe/macOSX.x86_64/gtfToGenePred")
+                    # Pin to v369 on Linux — the "latest" binary requires glibc >=2.32 which is too new for Debian 11 / Ubuntu 20.04.
+                    gtf_to_gene_pred_os_dir = "macOSX.x86_64" if platform.system() == "Darwin" else "linux.x86_64.v369"
+                    run(f"wget -nc https://hgdownload.soe.ucsc.edu/admin/exe/{gtf_to_gene_pred_os_dir}/gtfToGenePred")
                     run(f"chmod 777 gtfToGenePred")
                     gencode_gtf_paths[(genome_version, basic_or_comprehensive)] = os.path.basename(gencode_gtf_url)
         else:
@@ -152,7 +329,7 @@ def main():
 
             if genome_version == "37":
                 gencode_gtf_path_without_chr_prefix = gencode_gtf_path.replace(".gtf.gz", ".without_chr_prefix.gtf.gz")
-                run(f"gzcat {gencode_gtf_path} | sed 's/chr//g' | bgzip > {gencode_gtf_path_without_chr_prefix}")
+                run(f"gunzip -c {gencode_gtf_path} | sed 's/chr//g' | bgzip > {gencode_gtf_path_without_chr_prefix}")
                 gencode_gtf_path = gencode_gtf_path_without_chr_prefix
 
             # generate Pangolin annotation files
@@ -193,6 +370,13 @@ def main():
 
         return
 
+    if args.command == "update_transcript_tables":
+        if not args.gencode_version:
+            parser.error("--gencode-version is required for the update_transcript_tables command")
+
+        update_transcript_tables(genome_versions, args.gencode_version)
+        return
+
     if args.command == "test2":
         run(f"gcloud beta code dev")
         return
@@ -224,29 +408,71 @@ def main():
                 tag = get_tag(tool, genome_version)
                 dockerhub_tag = get_tag(tool, genome_version, repo_name="dockerhub")
                 service = get_service_name(tool, genome_version)
-                concurrency = 6    # if genome_version == '37' else 2
+                # gunicorn worker processes per instance (the `--workers` count baked into
+                # the image). Each worker is single-threaded (TF/torch thread pools are
+                # capped to 1 in the Dockerfile) so `workers` alone sets how many model
+                # inferences run at once. Lowered 6 -> 3 to ease CPU oversubscription on the
+                # 2-CPU instances: at 6 workers, >2 simultaneous cache-miss inferences shared
+                # 2 cores so each ~6s prediction stretched ~3x and tripped the 120s gunicorn
+                # timeout (SIGABRT -> 500/503). 3 workers is a modest 1.5x over 2 cores, so a
+                # single slow inference can't starve the others into the timeout; extra burst
+                # concurrency comes from scaling out across instances, not more workers.
+                workers = 3
+                # Cloud Run requests served concurrently per instance. Kept equal to
+                # `workers` (sync gunicorn workers serve one request each, so extra
+                # concurrency would just queue inside the instance instead of scaling out).
+                concurrency = 3
                 min_instances = 0  # if tool == 'pangolin' else 2
-                max_instances = 3
+                # Raised 3 -> 6 so bursts of cache-miss traffic scale out across instances
+                # instead of saturating a few and timing out (504). This is only a ceiling:
+                # min_instances=0 means idle services still scale to zero, so the baseline
+                # cost is unchanged.
+                max_instances = 6
+                # Keep dev image digests separate from prod so a stray non-dev
+                # deploy from the same checkout can't accidentally promote the
+                # dev image.
+                sha256_path = f"docker/{tool}/sha256_grch{genome_version}{'_dev' if args.dev else ''}.txt"
                 if not args.command or args.command == "build":
                     if args.docker_command == "podman":
                         run(f"gcloud --project {GCLOUD_PROJECT} auth print-access-token | podman login -u oauth2accesstoken --password-stdin us-central1-docker.pkg.dev")
 
-                    run(f"{args.docker_command} build -f docker/{tool}/Dockerfile --build-arg=\"CONCURRENCY={concurrency}\" --build-arg=\"GENOME_VERSION={genome_version}\" -t {tag}:latest -t {dockerhub_tag}:latest .")
+                    # In CI (USE_BUILDX_CACHE set; see deploy-on-tag.yml) build with buildx and a
+                    # per-service GitHub Actions layer cache, so unchanged layers (base image,
+                    # tensorflow-cpu, pip deps) restore instead of rebuilding from scratch on the
+                    # fresh runner. `scope={service}` keeps the 4 matrix builds from clobbering each
+                    # other's cache. --load puts the built image into the local docker store so the
+                    # push / pull / digest-capture steps below work unchanged. Locally the buildx
+                    # container driver and the gha backend aren't set up, so fall back to a plain build.
+                    build_cmd = (
+                        f"docker buildx build --load "
+                        f"--cache-from type=gha,scope={service} --cache-to type=gha,mode=max,scope={service} "
+                        if os.environ.get("USE_BUILDX_CACHE") else f"{args.docker_command} build "
+                    )
+                    run(f"{build_cmd}-f docker/{tool}/Dockerfile --build-arg=\"WORKERS={workers}\" --build-arg=\"GENOME_VERSION={genome_version}\" -t {tag}:latest -t {dockerhub_tag}:latest .")
                     run(f"{args.docker_command} push {tag}:latest")
                     run(f"{args.docker_command} push {dockerhub_tag}:latest")
 
                     run(f"{args.docker_command} pull {tag}:latest")
-                    run(f"{args.docker_command} inspect --format='{{{{index .RepoDigests 0}}}}' {tag}:latest | cut -f 2 -d @ > docker/{tool}/sha256_grch{genome_version}.txt")  # record the image's sha256
+                    run(f"{args.docker_command} inspect --format='{{{{range .RepoDigests}}}}{{{{println .}}}}{{{{end}}}}' {tag}:latest | grep 'us-central1-docker.pkg.dev' | cut -f 2 -d @ > {sha256_path}")  # record the image's sha256
 
                 if not args.command or args.command == "deploy":
-                    with open(f"docker/{tool}/sha256_grch{genome_version}.txt") as f:
+                    with open(sha256_path) as f:
                         sha256 = f.read().strip()
 
                     if not re.match("^sha256:[a-f0-9]{64}$", sha256):
-                        raise ValueError(f"Invalid sha256 value found in docker/{tool}/sha256_grch{genome_version}.txt: {sha256}")
+                        raise ValueError(f"Invalid sha256 value found in {sha256_path}: {sha256}")
 
-                    print(f"Deploying {service} with image sha256 {sha256}")
+                    print(f"Deploying {service} with image sha256 {sha256}{' (dev revision, no traffic)' if args.dev else ''}")
 
+                    dev_flags = "--no-traffic --tag dev " if args.dev else ""
+                    # Comma-separated list of IPs to hard-block at the API door
+                    # (server.py block_ips). Sourced from the BLOCKED_IPS
+                    # env var (set as a GitHub Actions repo Variable, or exported
+                    # locally); unset -> empty, which clears any previous value and
+                    # disables blocking. The "^@^" prefix tells gcloud to split
+                    # env-var assignments on "@" instead of ",", so the commas
+                    # between IPs stay inside the single BLOCKED_IPS value.
+                    blocked_ips_flag = f'--update-env-vars "^@^BLOCKED_IPS={os.environ.get("BLOCKED_IPS", "").strip()}" '
                     run(f"""gcloud \
 --project {GCLOUD_PROJECT} beta run deploy {service} \
 --image {tag}@{sha256} \
@@ -260,8 +486,19 @@ def main():
 --update-secrets=DB_PASSWORD=spliceai-lookup-db-password:2 \
 --allow-unauthenticated \
 --memory 4Gi \
---cpu 4
-""")
+--cpu 2 \
+--cpu-boost \
+--timeout 900s \
+{blocked_ips_flag}{dev_flags}""")
+
+                    if args.dev:
+                        print(f"To promote the dev revision of {service} to production, run:")
+                        print(f"  gcloud --project {GCLOUD_PROJECT} run services update-traffic {service} "
+                              f"--region us-central1 --to-tags dev=100")
+                    else:
+                        # Required when a previous --dev deploy left the service in manual-traffic mode; otherwise `gcloud run deploy` keeps traffic on the old revision.
+                        run(f"gcloud --project {GCLOUD_PROJECT} run services update-traffic {service} "
+                            f"--region us-central1 --to-latest")
 
                                 # --add-volume=name=ref,type=cloud-storage,bucket=spliceai-lookup-reference-data,readonly=true \
                 # --add-volume-mount=volume=ref,mount-path=/ref \

@@ -42,6 +42,31 @@ td {
     border-top: 1px solid rgba(34, 36, 38, .15);
 }
 
+/* Each boundary shows a single separator line drawn by the *upper* table's bottom
+   border, so the 1em margin gap sits below the line — between the line and the
+   lower section's title. */
+#sai10k-table {
+    border-top: 0 !important;
+}
+#sai10k-table + #other-predictors-table {
+    border-top: 0 !important;
+}
+
+#spliceai-header > tr:nth-child(2) > th:first-child,
+#pangolin-header > tr:nth-child(2) > th:first-child {
+    width: 30%;
+}
+#sai10k-header > tr:nth-child(2) > th:first-child {
+    width: 640px;
+}
+#sai10k-header > tr:nth-child(2) > th:nth-child(2) {
+    width: 200px;
+}
+
+#sai10k-table .sai10k-visualize-cell {
+    text-align: left;
+}
+
 table {
     font-size: 11pt !important;
     border-collapse: collapse !important;

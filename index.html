@@ -17,7 +17,17 @@
             "spliceai-38": "/spliceai-lookup/api/38",
         }
 
-        //console.log("Using SpliceAI API url:", baseApiUrl)
+        // If the URL hash contains api=dev, swap spliceai/pangolin URLs to
+        // their 'dev'-tagged Cloud Run revisions (deployed by
+        // build_and_deploy.py --dev). 'normalize' (liftover) is unaffected
+        // because build_and_deploy.py doesn't manage that service.
+        const _apiMatch = window.location.hash.match(/[?&#]api=([^&#]*)/)
+        if (_apiMatch && _apiMatch[1] === "dev") {
+            for (const k of ["pangolin-37", "pangolin-38", "spliceai-37", "spliceai-38"]) {
+                baseApiUrl[k] = baseApiUrl[k].replace(/^https:\/\//, "https://dev---")
+            }
+            console.log("api=dev: routing spliceai/pangolin requests to dev revisions:", baseApiUrl)
+        }
     </script>
     <meta content="width=device-width, initial-scale=1" charset="utf-8" name="viewport"/>
     <title>IMGH - SpliceAI Lookup</title>
@@ -28,7 +38,7 @@
     <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/semantic-ui@2.4.2/dist/semantic.min.js"></script>
     <script type="text/javascript" src="https://cdn.jsdelivr.net/npm/underscore@1.12.0/underscore-min.js"></script>
     <script type="text/javascript" src="https://unpkg.com/@gmod/tabix@1.6.1/dist/tabix-bundle.js"></script>
-    <script type="text/javascript" src="https://storage.googleapis.com/tgg-viewer/igv.js-bw2/dist/igv.min.js?version=2024-08-06"></script>
+    <script type="text/javascript" src="https://cdn.jsdelivr.net/gh/broadinstitute/SpliceAI-lookup-dev@main/igv.min.js"></script>
     <!-- script type="text/javascript" src="igv.min.js"></script -->
 
     <script async src="https://www.googletagmanager.com/gtag/js?id=G-483HVKZCL1"></script>
@@ -67,7 +77,7 @@
                                     <span style="white-space: nowrap;"><a href="https://pubmed.ncbi.nlm.nih.gov/30661751" target="_blank">SpliceAI</a>  <a href='https://github.com/Illumina/SpliceAI' target='_blank'><i class='github icon'></i></a></span>, 
                                     <span style="white-space: nowrap;"><a href="https://genomebiology.biomedcentral.com/articles/10.1186/s13059-022-02664-4" target="_blank">Pangolin</a>  <a href='https://github.com/tkzeng/Pangolin' target='_blank'><i class='github icon'></i></a></span>, 
                                     <span style="white-space: nowrap;"><a href="https://www.science.org/doi/10.1126/science.ads7373" target="_blank">PromoterAI</a>  <a href='https://github.com/Illumina/PromoterAI' target='_blank'><i class='github icon'></i></a></span>,
-                                    <span style="white-space: nowrap;"><a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC10187174/" target="_blank">PrimateAI-3D</a>  <a href='https://github.com/Illumina/PrimateAI-3D' target='_blank'><i class='github icon'></i></a></span>,</span><br />
+                                    <span style="white-space: nowrap;"><a href="https://www.ncbi.nlm.nih.gov/pmc/articles/PMC10187174/" target="_blank">PrimateAI-3D</a>  <a href='https://github.com/Illumina/PrimateAI-3D' target='_blank'><i class='github icon'></i></a></span>,
                                     <span style="white-space: nowrap;"><a href="https://www.science.org/doi/10.1126/science.adg7492" target="_blank">AlphaMissense</a>  <a href='https://github.com/google-deepmind/alphamissense' target='_blank'><i class='github icon'></i></a></span>
                                     and other scores:
                                 </div>
@@ -210,18 +220,23 @@
                 <div>
                     <a href="https://github.com/broadinstitute/SpliceAI-lookup/issues" target="_blank">SpliceAI-lookup/issues</a>: issues or feature requests for this website<br />
                     <br/>
-                    <b>December 14, 2025</b>
+                    <b>May 11, 2026</b>
                     <br />
-                    - In the 'Other scores' section, only populate the 'Points' column for missense variants since the calibration was only done for missense<br/>
-                    <br />
-                    <b>September 22, 2025</b>
-                    <br />
-                    - updated to Gencode v49 (was previously on v47)<br/>
-                    - added a new optional visualization track called<br/><b>"genes used for precomputed scores"</b>. It shows the Gencode v24 transcript models originally used by the SpliceAI authors to generate the precomputed SpliceAI score tables available from Illumina. This track can help explain some of the differences in scores between SpliceAI-lookup and these precomputed tables.<br/>
-                    <br />
+                    - Added <a href="https://academic.oup.com/bioinformatics/article/39/4/btad179/7109800" target="_blank">SpliceAI-10k Calculator</a> predictions<br/>
+		    - Updated list of Related web tools<br />
+                    <br />		    
                     <a id="more-details3-button" href="#"
                        onclick="$('#more-details3').show();$('#more-details3-button').hide();">[show older updates]</a>
                     <div id="more-details3" style="display:none">
+                        <b>December 14, 2025</b>
+			<br />
+			- In the 'Other scores' section, only populate the 'Points' column for missense variants since the calibration was only done for missense<br/>
+			<br />
+			<b>September 22, 2025</b>
+			<br />
+			- updated to Gencode v49 (was previously on v47)<br/>
+			- added a new optional visualization track called<br/><b>"genes used for precomputed scores"</b>. It shows the Gencode v24 transcript models originally used by the SpliceAI authors to generate the precomputed SpliceAI score tables available from Illumina. This track can help explain some of the differences in scores between SpliceAI-lookup and these precomputed tables.<br/>
+			<br />
                         <b>June 27, 2025</b>
                         <br />
                         - added PromoterAI scores for promoters of all protein-coding transcripts in Gencode v39 (not just the canonical transcripts)<br/>
@@ -233,7 +248,7 @@
                         - provided a table with detailed SpliceAI scores for insertion variants whenever donor or acceptor gain is predicted to occurs within the inserted sequence itself. This addresses <a href="https://github.com/broadinstitute/SpliceAI-lookup/issues/84" target="_blank">issue #84</a>.<br/>
                         <br />
                         <b style="color:#880000">MAJOR BUG FIX:</b> Between April and November of 2024, <b>Pangolin</b> scores were incorrectly computed for ~28% of hg38 variants and ~5% of hg19 variants due to a bug related to multiple requests being processed in parallel. This issue has now been fixed.<br/>SpliceAI scores were fine and were not affected by this bug.<br/>
-                        </br>
+                        <br/>
                         <b>November 3, 2024</b><br />
                         - added choice of Gencode <a href="https://genome.ucsc.edu/FAQ/FAQgenes.html#gencode" target="_blank">basic or comprehensive</a> transcripts<br />
                         - updated to Gencode v47 <br />
@@ -302,7 +317,8 @@
                     <div>
                       <b>Related web tools:</b><br/>
                         <a href="https://liftover.broadinstitute.org" target="_blank">liftover</a>: for variants/positions/intervals (hg19 <=> hg38 <=> T2T)<br/>		      
-                <a href="https://tgg-viewer.broadinstitute.org" target="_blank">TGG Viewer</a>: igv.js-based web viewer for public reference tracks and private data in Google Storage buckets. Has custom track types for RNA-seq <a href="https://github.com/igvteam/igv.js/pull/1019#issue-521944897" target="_blank">splice junctions</a> and <a href="https://github.com/igvteam/igv.js/pull/1055#issue-560042328" target="_blank">gCNV</a> variants.<br/>
+			<a href="https://genelookup.broadinstitute.org/#showRs=1&q=SMN" target="_blank">gene-lookup</a>: monogenic gene-disease associations lookup<br/>
+			<a href="https://trexplorer.broadinstitute.org/#sc=HPRC256_AlleleHistogram&sd=DESC&showIGV=1&igvLoc=chr4%3A3074820-3074990&showRs=1&q=HTT" target="_blank">TRExplorer</a>: tandem repeat annotations and population allele freqs<br/>
                     </div>
                 </div>
             </div>
@@ -358,7 +374,7 @@
                         </tr>
                         <tr>
                             <th class="table-header">Variant</th>
-                            <th class="table-header" style="white-space: nowrap">Gene
+                            <th class="table-header" style="white-space: nowrap">Transcript
                                 <div style="float:right;">
                                     <span class='transcript-color-legend'
                                           style="background-color: var(--MAIN_TRANSCRIPT_BACKGROUND_COLOR)!important">&nbsp;</span>
@@ -373,7 +389,7 @@
                                                                                  data-html="Delta scores range from 0 to 1 and can be interpreted as the probability that the variant affects splicing at any position within a window around it (+/- 500bp by default). In the SpliceAI paper, a detailed characterization is provided for 0.2 (high recall), 0.5 (recommended), and 0.8 (high precision) cutoffs. Consequently, scores of 0.2 or higher appear in <b style='color:#1fb839'>green</b>, 0.5 or higher appear in <b style='color:#FFCB1F'>yellow</b>, and 0.8 or higher appear in <b style='color:#FF0000'>red</b>."></i>
                             </th>
                             <th class="table-header" style="white-space: nowrap">position &nbsp; <i class='question circle outline icon'
-                                                                                data-content="For each variant, SpliceAI looks within a window (+/- 500bp by default) to see how the variant affects the probabily of different positions serving as splice acceptors or donors. The offsets in this column represent positions with the biggest change in probability within the window. Negative values are to the left of the variant in genomic coords, regardless of transcript strand."></i>
+                                                                                data-content="For each variant, SpliceAI looks within a window (+/- 500bp by default) to see how the variant affects the probability of different positions serving as splice acceptors or donors. The offsets in this column represent positions with the biggest change in probability within the window. Negative values are to the left of the variant in genomic coords, regardless of transcript strand."></i>
                             </th>
                             <th class="table-header ref-score-column" style="white-space: nowrap">
                                 REF score &nbsp; <i class='question circle outline icon'
@@ -397,13 +413,13 @@
                             </tr>
                             <tr>
                                 <th class="table-header">Variant</th>
-                                <th class="table-header">Gene</th>
+                                <th class="table-header">Transcript</th>
                                 <th class="table-header">&#916;&nbsp; type</th>
                                 <th class="table-header" style="white-space: nowrap">&#916;&nbsp; score &nbsp; <i class='question circle outline icon'
                                                                                      data-html="Delta scores range from 0 to 1 and can be interpreted as the probability that the variant affects splicing at any position within a window around it (+/- 500bp by default). Pangolin does not recommend specific score thresholds; however, here scores of 0.2 or higher appear in <b style='color:#1fb839'>green</b>, 0.5 or higher appear in <b style='color:#FFCB1F'>yellow</b>, and 0.8 or higher appear in <b style='color:#FF0000'>red</b>."></i>
                                 </th>
                                 <th class="table-header" style="white-space: nowrap">position &nbsp; <i class='question circle outline icon'
-                                                                                    data-content="For each variant, Pangolin looks within a window (+/- 500bp by default) to see how the variant affects the probability of splicing occuring at different positions. The offsets in this column represent positions with the biggest change in probability within the window. Negative values are upstream (5&#039;) of the variant, and positive are downstream (3&#039;) of the variant."></i>
+                                                                                    data-content="For each variant, Pangolin looks within a window (+/- 500bp by default) to see how the variant affects the probability of splicing occurring at different positions. The offsets in this column represent positions with the biggest change in probability within the window. Negative values are upstream (5&#039;) of the variant, and positive are downstream (3&#039;) of the variant."></i>
                                 </th>
                                 <th class="table-header ref-score-column" style="white-space: nowrap">
                                     REF score &nbsp; <i class='question circle outline icon'
@@ -411,6 +427,19 @@
                                 <th class="table-header alt-score-column" style="white-space: nowrap">
                                     ALT score &nbsp; <i class='question circle outline icon'
                                                 data-content="Pangolin's computed probability that the given position is a splice site based on the alternate haplotype sequence."></i></th>
+                            </tr>
+                        </thead>
+                    </table>
+                    <table id="sai10k-table" class="ui stackable table">
+                        <thead id="sai10k-header">
+                            <tr>
+                                <th style="background-color:white" colspan="4">Predicted Splicing Consequences:</th>
+                            </tr>
+                            <tr>
+                                <th class="table-header">Transcript</th>
+                                <th class="table-header">Method</th>
+                                <th class="table-header">Output</th>
+                                <th class="table-header"></th>
                             </tr>
                         </thead>
                     </table>
@@ -526,6 +555,7 @@
 
 <script type="text/javascript" src="index.js"></script>
 <script>
+
 
 
 </script>
