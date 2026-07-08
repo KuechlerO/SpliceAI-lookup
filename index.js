@@ -1351,8 +1351,16 @@ const updateVisualizationCheckboxes = (readFromLocalStorage, genomeVersion) => {
 
         // if there are tracksToShow in local storage, overwrite defaults with those settings
         const fromStorage = localStorage.getItem("tracksToShow")
+        let fromStorageJson = null
         if (fromStorage) {
-            const fromStorageJson = JSON.parse(fromStorage)
+            try {
+                fromStorageJson = JSON.parse(fromStorage)
+            } catch (e) {
+                console.warn("Could not parse tracksToShow from localStorage; resetting:", e)
+                localStorage.removeItem("tracksToShow")
+            }
+        }
+        if (fromStorageJson) {
             for (const key of Object.keys(fromStorageJson)) {
                 tracksToShow[key] = fromStorageJson[key]
                 try {
@@ -1430,10 +1438,10 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
     const tracksToShow = updateVisualizationCheckboxes(false, genomeVersion)
 
     // log event
-    makeRequest(`${baseApiUrl['pangolin-37']}/log/show_igv?details=${encodeURIComponent(JSON.stringify(tracksToShow))}&hg=${genomeVersion}&distance=${apiResponseJson.distance}&mask=${apiResponseJson.mask}&variant=${apiResponseJson.variant}`)
+    makeRequest(`${baseApiUrl['pangolin-37']}/log/show_igv?details=${encodeURIComponent(JSON.stringify(tracksToShow))}&hg=${encodeURIComponent(genomeVersion)}&distance=${encodeURIComponent(apiResponseJson.distance)}&mask=${encodeURIComponent(apiResponseJson.mask)}&variant=${encodeURIComponent(apiResponseJson.variant)}`)
 
-    let minPos = 1e9
-    let maxPos = 0
+    let minPos = null
+    let maxPos = null
     for (const apiResponse of [spliceaiResponseJson, pangolinResponseJson]) {
         if (!apiResponse) {
             continue
@@ -1445,9 +1453,15 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
             scores["chr"] = chrom
             scores["start"] = scores["pos"]
             scores["end"] = scores["pos"]
-            minPos = Math.min(minPos, scores["pos"])
-            maxPos = Math.max(maxPos, scores["pos"])
+            minPos = (minPos === null) ? scores["pos"] : Math.min(minPos, scores["pos"])
+            maxPos = (maxPos === null) ? scores["pos"] : Math.max(maxPos, scores["pos"])
         }
+    }
+    // Fall back to the variant position if both responses had no non-zero
+    // scores (empty array bypasses the apiResponse.allNonZeroScores guard).
+    if (minPos === null || maxPos === null) {
+        minPos = variantPos
+        maxPos = variantPos
     }
 
     // specify IGV tracks and the data to display in them
@@ -1465,6 +1479,9 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
     })
 
     if (tracksToShow["igv-variant"]) {
+        // For deletions, skip the anchor base by adding 1 to start
+        const isDeletion = variantRef.length > variantAlt.length
+        const variantStart = isDeletion ? variantPos : variantPos - 1
         tracks.push({
             name: "Variant",
             type: "vcf",
@@ -1474,7 +1491,7 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
                 {
                     chr: chrom,   //see createVCFVariant function in the igv.js repo for the allowed fields
                     pos: variantPos,
-                    start: variantPos - 1,
+                    start: variantStart,
                     end: variantPos + variantRef.length - 1,
                     referenceAllele: variantRef,
                     alternateBases: variantAlt,
@@ -1550,7 +1567,7 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
     }
 
     if (tracksToShow["igv-gencode-genes"]) {
-        const gencodeTrackPath = `gs://tgg-viewer/ref/GRCh${genomeVersion}/gencode_${GENCODE_VERSION}/gencode.${GENCODE_VERSION}.GRCh${genomeVersion}.sorted.txt.gz`
+        const gencodeTrackPath = `https://storage.googleapis.com/tgg-viewer/ref/GRCh${genomeVersion}/gencode_${GENCODE_VERSION}/gencode.${GENCODE_VERSION}.GRCh${genomeVersion}.sorted.txt.gz`
 
         tracks.push({
             name: `Gencode ${GENCODE_VERSION}`,
@@ -1571,14 +1588,14 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
         tracks.push({
             name: "MANE v1.4",
             format: "gtf",
-            url: "gs://tgg-viewer/ref/GRCh38/MANE_v1_4/MANE.GRCh38.v1.4.ensembl_genomic.sorted.gtf.gz",
-            indexURL: "gs://tgg-viewer/ref/GRCh38/MANE_v1_4/MANE.GRCh38.v1.4.ensembl_genomic.sorted.gtf.gz.tbi",
+            url: "https://storage.googleapis.com/tgg-viewer/ref/GRCh38/MANE_v1_4/MANE.GRCh38.v1.4.ensembl_genomic.sorted.gtf.gz",
+            indexURL: "https://storage.googleapis.com/tgg-viewer/ref/GRCh38/MANE_v1_4/MANE.GRCh38.v1.4.ensembl_genomic.sorted.gtf.gz.tbi",
             height: 100,
         })
     }
 
     if (tracksToShow["igv-spliceai-precomputed-score-genes"]) {
-        const precomputedScoresGeneTrackPath = `gs://tgg-viewer/ref/GRCh${genomeVersion}/gencode_v24/gencode_v24_annotations.grch${genomeVersion}.bed.gz`
+        const precomputedScoresGeneTrackPath = `https://storage.googleapis.com/tgg-viewer/ref/GRCh${genomeVersion}/gencode_v24/gencode_v24_annotations.grch${genomeVersion}.bed.gz`
 
         tracks.push({
             name: `Genes used for precomputed scores`,
@@ -1608,8 +1625,8 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
                                     Clicking on the arrow displays additional details.`,
                             type: "spliceJunctions",
                             height: 100,
-                            url: `gs://tgg-viewer/ref/GRCh38/spliceai/spliceai_scores.raw.snps_and_indels.hg38.filtered.sorted.score_${minScore}.splice_${splicePredictionType}.bed.gz`,
-                            indexURL: `gs://tgg-viewer/ref/GRCh38/spliceai/spliceai_scores.raw.snps_and_indels.hg38.filtered.sorted.score_${minScore}.splice_${splicePredictionType}.bed.gz.tbi`,
+                            url: `https://storage.googleapis.com/tgg-viewer/ref/GRCh38/spliceai/spliceai_scores.raw.snps_and_indels.hg38.filtered.sorted.score_${minScore}.splice_${splicePredictionType}.bed.gz`,
+                            indexURL: `https://storage.googleapis.com/tgg-viewer/ref/GRCh38/spliceai/spliceai_scores.raw.snps_and_indels.hg38.filtered.sorted.score_${minScore}.splice_${splicePredictionType}.bed.gz.tbi`,
                         }
                     )
                 }
@@ -1641,15 +1658,15 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
                     tracks: [{
                         type: "wig",
                         format: "bigwig",
-                        url: `gs://tgg-viewer/ref/GRCh38/gtex_v8/${filenamePrefix}${filenameSuffix}.bigWig`,
+                        url: `https://storage.googleapis.com/tgg-viewer/ref/GRCh38/gtex_v8/${filenamePrefix}${filenameSuffix}.bigWig`,
                     }, {
                         type: 'spliceJunctions',
                         format: 'bed',
                         minJunctionEndsVisible: 1,
                         colorBy: 'strand',
                         minTotalReads: 3,
-                        url: `gs://tgg-viewer/ref/GRCh38/gtex_v8/${filenamePrefix}${filenameSuffix}.junctions.bed.gz`,
-                        indexURL: `gs://tgg-viewer/ref/GRCh38/gtex_v8/${filenamePrefix}${filenameSuffix}.junctions.bed.gz.tbi`,
+                        url: `https://storage.googleapis.com/tgg-viewer/ref/GRCh38/gtex_v8/${filenamePrefix}${filenameSuffix}.junctions.bed.gz`,
+                        indexURL: `https://storage.googleapis.com/tgg-viewer/ref/GRCh38/gtex_v8/${filenamePrefix}${filenameSuffix}.junctions.bed.gz.tbi`,
                     }],
                 })
             }
@@ -1661,7 +1678,7 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
                 description: "100bp k-mer mappability track from UCSC. Lower values indicate regions that are not unique",
                 type: "wig",
                 format: "bigwig",
-                url: "gs://tgg-viewer/ref/GRCh38/mappability/GRCh38_no_alt_analysis_set_GCA_000001405.15-k100_m2.bw",
+                url: "https://storage.googleapis.com/tgg-viewer/ref/GRCh38/mappability/GRCh38_no_alt_analysis_set_GCA_000001405.15-k100_m2.bw",
                 height: 100,
             })
         }
@@ -1671,8 +1688,8 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
                 name: "SegDups",
                 description: "Segmental duplications track from UCSC",
                 format: "gtf",
-                url: "gs://tgg-viewer/ref/GRCh38/segdups/segdups.gtf.gz",
-                indexURL: "gs://tgg-viewer/ref/GRCh38/segdups/segdups.gtf.gz.tbi",
+                url: "https://storage.googleapis.com/tgg-viewer/ref/GRCh38/segdups/segdups.gtf.gz",
+                indexURL: "https://storage.googleapis.com/tgg-viewer/ref/GRCh38/segdups/segdups.gtf.gz.tbi",
                 height: 100,
             })
         }
@@ -1688,7 +1705,7 @@ const generateIgvConfig = (spliceaiResponseJson, pangolinResponseJson, genomeVer
         "name": "Human (GRCh37/hg19)",
         "fastaURL": "https://igv.org/genomes/data/hg19/hg19.fasta",
         "indexURL": "https://igv.org/genomes/data/hg19/hg19.fasta.fai",
-        "cytobandURL": "https://s3.amazonaws.com/igv.org.genomes/hg19/annotations/cytoBandIdeo.txt.gz",
+        "cytobandURL": "https://hgdownload.soe.ucsc.edu/goldenPath/hg19/database/cytoBand.txt.gz",
         "aliasURL": "https://s3.amazonaws.com/igv.org.genomes/hg19/hg19_alias.tab",
         "chromosomeOrder": "chr1, chr2, chr3, chr4, chr5, chr6, chr7, chr8, chr9, chr10, chr11, chr12, chr13, chr14, chr15, chr16, chr17, chr18, chr19, chr20, chr21, chr22, chrX, chrY",
         "tracks": tracks,
@@ -2083,6 +2100,15 @@ const handleSubmit = async () => {
     updateVisualizationCheckboxes(false, genomeVersion)
 
     transcriptFilterPreference = "main"
+
+    // Tear down any existing IGV browser so the next "Show" click rebuilds
+    // it from scratch with only the new variant's tracks.
+    if (window.igvBrowser) {
+        try { igv.removeBrowser(window.igvBrowser) } catch (e) { console.warn("igv.removeBrowser failed:", e) }
+        window.igvBrowser = null
+    }
+    $("#igv-table, #igv-div").hide()
+    $("#show-igv-button").text("Show")
 
     $("#submit-button").addClass("loading disabled")
     $("#batch-analysis-progress-wrap").hide()

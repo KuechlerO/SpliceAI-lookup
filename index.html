@@ -17,16 +17,25 @@
             "spliceai-38": "/spliceai-lookup/api/38",
         }
 
-        // If the URL hash contains api=dev, swap spliceai/pangolin URLs to
-        // their 'dev'-tagged Cloud Run revisions (deployed by
-        // build_and_deploy.py --dev). 'normalize' (liftover) is unaffected
-        // because build_and_deploy.py doesn't manage that service.
+        // Route spliceai/pangolin requests to their 'dev'-tagged Cloud Run
+        // revisions (deployed by build_and_deploy.py --dev) when EITHER:
+        //   - this page is served from the dev GitHub Pages site
+        //     (broadinstitute.github.io/SpliceAI-lookup-dev), so the dev site
+        //     always talks to the dev API without needing a URL flag, OR
+        //   - the URL hash contains api=dev (manual override, e.g. for local
+        //     testing or forcing dev from another host).
+        // 'normalize' (liftover) is unaffected because build_and_deploy.py
+        // doesn't manage that service.
+        const _servedFromDevSite = (
+            window.location.hostname === "broadinstitute.github.io"
+            && window.location.pathname.startsWith("/SpliceAI-lookup-dev")
+        )
         const _apiMatch = window.location.hash.match(/[?&#]api=([^&#]*)/)
-        if (_apiMatch && _apiMatch[1] === "dev") {
+        if (_servedFromDevSite || (_apiMatch && _apiMatch[1] === "dev")) {
             for (const k of ["pangolin-37", "pangolin-38", "spliceai-37", "spliceai-38"]) {
                 baseApiUrl[k] = baseApiUrl[k].replace(/^https:\/\//, "https://dev---")
             }
-            console.log("api=dev: routing spliceai/pangolin requests to dev revisions:", baseApiUrl)
+            console.log("Routing spliceai/pangolin requests to dev revisions:", baseApiUrl)
         }
     </script>
     <meta content="width=device-width, initial-scale=1" charset="utf-8" name="viewport"/>
@@ -220,7 +229,11 @@
                 <div>
                     <a href="https://github.com/broadinstitute/SpliceAI-lookup/issues" target="_blank">SpliceAI-lookup/issues</a>: issues or feature requests for this website<br />
                     <br/>
-                    <b>May 11, 2026</b>
+                    <b>July 1st, 2026</b>
+                    <br />
+                    - improved SpliceAI-10k output when SpliceAI predicts multiple acceptor/donor shifts (examples: <a href="https://spliceailookup.broadinstitute.org/#variant=NM_024675.4(PALB2)%3Ac.47A%3EG&hg=38&bc=basic&distance=500&mask=0&ra=0" target="_blank">NM_024675.4(PALB2):c.47A>G</a>, <a href="https://spliceailookup.broadinstitute.org/#variant=NM_000546.6(TP53)%3Ac.673-1G%3EA&hg=38&bc=basic&distance=500&mask=0&ra=0" target="_blank">NM_000546.6(TP53):c.673-1G>A</a>)<br/>
+                    <br />
+                    <b>May, 2026</b>
                     <br />
                     - Added <a href="https://academic.oup.com/bioinformatics/article/39/4/btad179/7109800" target="_blank">SpliceAI-10k Calculator</a> predictions<br/>
 		    - Updated list of Related web tools<br />
@@ -555,6 +568,7 @@
 
 <script type="text/javascript" src="index.js"></script>
 <script>
+
 
 
 
