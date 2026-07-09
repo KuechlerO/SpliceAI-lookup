@@ -552,6 +552,98 @@ def get_transcript_structures(conn, transcript_ids, genome_version):
     return result
 
 
+# Lazy cache: (genome_version, basic_or_comprehensive) -> {transcript_id_no_version: structure}
+_SPLICEAI_TRANSCRIPT_STRUCTURE_CACHE = {}
+
+
+def _structure_from_spliceai_annotation_row(row):
+    """Convert one SpliceAI annotation row to the structure dict used by SAI-10k."""
+    exon_starts_1based = [int(s) + 1 for s in row["EXON_START"].rstrip(",").split(",") if s]
+    exon_ends_1based = [int(s) for s in row["EXON_END"].rstrip(",").split(",") if s]
+    return {
+        "EXON_STARTS": exon_starts_1based,
+        "EXON_ENDS": exon_ends_1based,
+        # CDS coordinates are not present in the SpliceAI annotation txt; frameshift
+        # annotations may be incomplete without a DB lookup, but aberration calls work.
+        "CDS_START": None,
+        "CDS_END": None,
+        "STRAND": row["STRAND"],
+    }
+
+
+def _load_spliceai_transcript_structure_cache(genome_version, basic_or_comprehensive):
+    """Load transcript exon structure from the SpliceAI annotation txt.gz file."""
+    cache_key = (genome_version, basic_or_comprehensive)
+    if cache_key in _SPLICEAI_TRANSCRIPT_STRUCTURE_CACHE:
+        return _SPLICEAI_TRANSCRIPT_STRUCTURE_CACHE[cache_key]
+
+    annotation_path = SPLICEAI_ANNOTATION_PATHS[(genome_version, basic_or_comprehensive)]
+    t0 = time.perf_counter()
+    structures = {}
+    with gzip.open(annotation_path, "rt") as annotation_f:
+        header = annotation_f.readline().rstrip("\n").split("\t")
+        name_idx = header.index("#NAME")
+        strand_idx = header.index("STRAND")
+        exon_start_idx = header.index("EXON_START")
+        exon_end_idx = header.index("EXON_END")
+        for line in annotation_f:
+            fields = line.rstrip("\n").split("\t")
+            transcript_id_without_version = fields[name_idx].split(".")[0]
+            row = {
+                "STRAND": fields[strand_idx],
+                "EXON_START": fields[exon_start_idx],
+                "EXON_END": fields[exon_end_idx],
+            }
+            structures[transcript_id_without_version] = _structure_from_spliceai_annotation_row(row)
+
+    _SPLICEAI_TRANSCRIPT_STRUCTURE_CACHE[cache_key] = structures
+    print(
+        f"Loaded {len(structures):,d} transcript structures from {annotation_path} "
+        f"in {(time.perf_counter() - t0) * 1000:.1f}ms",
+        flush=True,
+    )
+    return structures
+
+
+def get_transcript_structures_from_spliceai_annotation(genome_version, basic_or_comprehensive, transcript_ids):
+    """Fetch transcript exon structure from the local SpliceAI annotation file.
+
+    Used when PostgreSQL is unavailable or a transcript is missing from the DB.
+    """
+    if not transcript_ids:
+        return {}
+
+    all_structures = _load_spliceai_transcript_structure_cache(genome_version, basic_or_comprehensive)
+    return {
+        transcript_id: all_structures[transcript_id]
+        for transcript_id in transcript_ids
+        if transcript_id in all_structures
+    }
+
+
+def enrich_transcript_structures(genome_version, basic_or_comprehensive, candidate_ids, conn):
+    """Return transcript structures from DB, falling back to the SpliceAI annotation file."""
+    structures = {}
+    db_unavailable = False
+
+    if conn is None:
+        db_unavailable = True
+    else:
+        structures = get_transcript_structures(conn, candidate_ids, genome_version)
+        if structures is None:
+            db_unavailable = True
+            structures = {}
+
+    missing_ids = [tid for tid in candidate_ids if tid not in structures]
+    if missing_ids:
+        annotation_structures = get_transcript_structures_from_spliceai_annotation(
+            genome_version, basic_or_comprehensive, missing_ids,
+        )
+        structures.update(annotation_structures)
+
+    return structures, db_unavailable
+
+
 # Operational tables (cache, log, restricted_ips, whitelist_ips) are created
 # automatically by _init_database_schema (see _SCHEMA_DDL_STATEMENTS above).
 
@@ -741,39 +833,28 @@ def get_spliceai_scores(variant, genome_version, distance_param, mask_param, bas
             for transcript_scores in candidate_transcripts
         ]
         with get_db_connection() as conn:
-            if conn is None:
-                # DB unavailable: structures dict stays empty, SAI-10k-calc
-                # silently falls back to its annotation defaults instead of
-                # EXON_STARTS/EXON_ENDS/CDS_*/STRAND, and the degraded result
-                # would be cached under the same key. Log loudly and skip the
-                # cache write so the next request retries.
-                print(f"WARNING: DB unavailable for transcript-structure lookup for {variant}; "
-                      f"SAI-10k will use annotation defaults and the result will not be cached.", flush=True)
-                skip_cache = True
-                db_unavailable = True
-            else:
-                structures = get_transcript_structures(conn, candidate_ids, genome_version)
-                if structures is None:
-                    # Query failed mid-flight. Treat the same as a missing
-                    # connection: log once, skip the cache, and suppress the
-                    # per-row "not found" warnings below.
-                    print(f"WARNING: DB query for transcript-structure lookup failed for {variant}; "
-                          f"SAI-10k will use annotation defaults and the result will not be cached.", flush=True)
-                    structures = {}
-                    skip_cache = True
-                    db_unavailable = True
+            structures, db_unavailable = enrich_transcript_structures(
+                genome_version, basic_or_comprehensive_param, candidate_ids, conn,
+            )
+            if db_unavailable:
+                print(
+                    f"WARNING: DB unavailable for transcript-structure lookup for {variant}; "
+                    f"using SpliceAI annotation file fallback.",
+                    flush=True,
+                )
 
         for transcript_scores, transcript_id_without_version in zip(candidate_transcripts, candidate_ids):
             transcript_structure = structures.get(transcript_id_without_version)
             if transcript_structure:
                 transcript_scores.update(transcript_structure)
-            elif not db_unavailable:
-                # DB was reachable but this row is missing. Without skip_cache,
-                # the degraded result (SAI-10k falling back to annotation
-                # defaults) would be cached permanently and re-served forever.
-                print(f"WARNING: transcript {transcript_id_without_version} not found in "
-                      f"transcripts_hg{genome_version} for {variant}; "
-                      f"SAI-10k will use annotation defaults and the result will not be cached.", flush=True)
+            else:
+                # No structure from DB or annotation file — SAI-10k cannot classify.
+                print(
+                    f"WARNING: transcript {transcript_id_without_version} not found in "
+                    f"transcripts_hg{genome_version} or SpliceAI annotations for {variant}; "
+                    f"SAI-10k predictions will be incomplete.",
+                    flush=True,
+                )
                 skip_cache = True
     db_enrich_ms = (time.perf_counter() - db_enrich_t0) * 1000
 
