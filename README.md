@@ -1,21 +1,145 @@
 This repo contains: 
-- client-side code for [spliceailookup.broadinstitute.org](https://spliceailookup.broadinstitute.org/) - contained within the [index.html](index.html) file and hosted via GitHub Pages.
+- client-side code for [spliceailookup.broadinstitute.org](https://spliceailookup.broadinstitute.org/) - contained within [index.html](index.html), [index.js](index.js), and [index.css](index.css).
 - server-side code for SpliceAI and Pangolin REST APIs - contained within the [google_cloud_run_services/](google_cloud_run_services/) subdirectory and hosted on Google Cloud Run. 
 - the original Flask web app that previously powered spliceailookup.broadinstitute.org - contained within the [original_flask_app/](original_flask_app/) subdirectory. 
 
 ---
 
-### SpliceAI-Lookup Service (Charité deployment)
+### SpliceAI-Lookup Service (local deployment)
+
 SpliceAI-Lookup Service  
-provided by Charité - Institut für Medizinische Genetik und Humangenetik  
+implemented at Charité - Institut für Medizinische Genetik und Humangenetik  
 - coded by Oliver Küchler (Problems/Questions: oliver.kuechler@charite.de)
 
-#### Quickstart to serve frontend:
+This fork serves the UI locally and proxies SpliceAI requests to dedicated API containers. Pangolin and liftover still use the Broad Institute Cloud Run endpoints configured in [index.html](index.html).
 
-```python
+#### Architecture
+
+```
+Browser → nginx (:80)
+            ├─ /spliceai-lookup/          → modified-spliceai-lookup (frontend + Flask shim)
+            ├─ /spliceai-lookup/api/37/   → spliceai-37-api (weisburd/spliceai-37)
+            └─ /spliceai-lookup/api/38/   → spliceai-38-api (weisburd/spliceai-38)
+                                              └─ postgres (transcript tables + cache)
+```
+
+SAI-10k-calc needs per-transcript **exon and CDS coordinates**. The stock `weisburd` Docker images load those from PostgreSQL (`transcripts_hg37` / `transcripts_hg38`). Without that database, SAI-10k can still classify aberration types using a fallback in [google_cloud_run_services/server.py](google_cloud_run_services/server.py), but frameshift / start-codon labels will show as "non-coding change" because CDS bounds are missing.
+
+#### Docker Compose deployment
+
+Files:
+
+| File | Purpose |
+|------|---------|
+| [docker-compose.yml](docker-compose.yml) | Full stack: frontend, SpliceAI APIs, PostgreSQL, Redis, nginx |
+| [.env.example](.env.example) | Template for `SPLICEAI_DB_PASSWORD` and optional proxy settings |
+| [deploy/nginx.conf.example](deploy/nginx.conf.example) | nginx reverse-proxy config (copy to `nginx.conf`) |
+| [google_cloud_run_services/.env.example](google_cloud_run_services/.env.example) | DB host for `update_transcript_tables` |
+
+**1. Configure environment**
+
+```bash
+cp .env.example .env
+# Edit .env — set SPLICEAI_DB_PASSWORD to a strong password
+
+cp deploy/nginx.conf.example nginx.conf
+```
+
+**2. Start PostgreSQL**
+
+```bash
+docker compose up -d postgres
+```
+
+Verify the password (no `psql` on the host required):
+
+```bash
+docker compose exec -e PGPASSWORD="$SPLICEAI_DB_PASSWORD" postgres \
+  psql -U postgres -d spliceai-lookup-db -c 'SELECT 1;'
+```
+
+**3. One-time: load SAI-10k transcript tables**
+
+The sorted genePred files are **not** inside the `weisburd` API images. Download them from Broad's public bucket:
+
+```bash
+cd google_cloud_run_services
+mkdir -p docker/ref/GRCh38 docker/ref/GRCh37
+
+wget -O docker/ref/GRCh38/gencode.v49.GRCh38.sorted.txt.gz \
+  https://storage.googleapis.com/tgg-viewer/ref/GRCh38/gencode_v49/gencode.v49.GRCh38.sorted.txt.gz
+
+wget -O docker/ref/GRCh37/gencode.v49.GRCh37.sorted.txt.gz \
+  https://storage.googleapis.com/tgg-viewer/ref/GRCh37/gencode_v49/gencode.v49.GRCh37.sorted.txt.gz
+```
+
+Configure credentials for [build_and_deploy.py](google_cloud_run_services/build_and_deploy.py):
+
+```bash
+cp .env.example .env          # inside google_cloud_run_services/
+# Set SPLICEAI_LOOKUP_DB_HOST=localhost
+
+echo 'your-db-password' > .pgpass   # same value as SPLICEAI_DB_PASSWORD in compose .env
+chmod 600 .pgpass
+
+pip install pandas psycopg2-binary tqdm python-dotenv
+python3 build_and_deploy.py update_transcript_tables --gencode-version v49
+```
+
+Confirm rows were loaded:
+
+```bash
+docker compose exec postgres psql -U postgres -d spliceai-lookup-db \
+  -c "SELECT COUNT(*) FROM transcripts_hg38;"
+```
+
+After this step you can remove the `ports: "5432:5432"` mapping from the `postgres` service in [docker-compose.yml](docker-compose.yml) if you do not need host access to the database.
+
+**4. Start the full stack**
+
+```bash
+docker compose up -d --build
+```
+
+Open the site via nginx on port 80, or test APIs directly:
+
+- hg38: http://localhost:8038/spliceai/?hg=38&variant=chr8-140300616-T-G  
+- hg37: http://localhost:8037/spliceai/?hg=37&variant=11-63342520-T-C  
+
+**5. Verify SAI-10k**
+
+Query a variant in the UI and inspect the browser console. A successful setup shows:
+
+- `sai10kPredictions.aberrations` with at least one entry (when applicable)
+- `sai10kPredictions.transcript_info.cds_start` / `cds_end` populated
+- `transcript_info.is_coding: true` for protein-coding transcripts
+
+#### Patched API server without rebuilding images
+
+[docker-compose.yml](docker-compose.yml) bind-mounts [google_cloud_run_services/server.py](google_cloud_run_services/server.py) and [sai10k_predictions.py](google_cloud_run_services/sai10k_predictions.py) into both API containers. This picks up local fixes (including the annotation-file fallback) without building custom images. For production parity with Broad, keep PostgreSQL populated as described above so CDS-based SAI-10k labels match [spliceailookup.broadinstitute.org](https://spliceailookup.broadinstitute.org).
+
+To use the stock Hub images without mounts, remove the `volumes:` blocks under `spliceai-37-api` and `spliceai-38-api`.
+
+#### Frontend-only quickstart (development)
+
+Without Docker:
+
+```bash
 python3 -m http.server 8000
 ```
-Open http://localhost:8000/index.html in your browser.
+
+Open http://localhost:8000/index.html. SpliceAI API calls will fail unless nginx/API containers are running and `index.html` points to them.
+
+#### Troubleshooting
+
+| Symptom | Likely cause |
+|---------|----------------|
+| SAI-10k always "No prediction" | API containers not using patched `server.py` and no PostgreSQL transcript tables |
+| SAI-10k predictions but "non-coding change" only | Transcript tables missing CDS data — run `update_transcript_tables` |
+| `password authentication failed` during `update_transcript_tables` | `.pgpass` password does not match `POSTGRES_PASSWORD`; or host port 5432 points at a different Postgres instance |
+| `GenePred file not found` | Download sorted genePred files (step 3) — they are not in the `weisburd` images |
+| hg19 IGV errors | Ensure latest [index.js](index.js) is deployed (GRCh37 reference uses `fastaURL`/`indexURL`, not `twoBitURL`) |
+| `POSTGRES_PASSWORD` ignored after change | Volume was initialized with an old password — recreate the `postgres-data` volume |
 
 ---
 

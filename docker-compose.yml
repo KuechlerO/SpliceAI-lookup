@@ -1,0 +1,121 @@
+# local full-stack deployment for SpliceAI-lookup.
+#
+# Services:
+#   - modified-spliceai-lookup: frontend (index.html / index.js) + Flask static shim
+#   - spliceai-37-api / spliceai-38-api: SpliceAI models + SAI-10k (Broad docker images)
+#   - postgres: transcript structure + response cache for SAI-10k CDS annotations
+#   - redis-cache: used by the frontend container (if configured)
+#   - nginx: reverse proxy (copy deploy/nginx.conf.example to nginx.conf)
+#
+# Setup: see README.md section "Docker Compose deployment".
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${SPLICEAI_DB_PASSWORD}
+      POSTGRES_DB: spliceai-lookup-db
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - web-network
+  # Publish 5432 only while running update_transcript_tables from the host.
+  # Remove or comment out after the one-time DB load if you prefer.
+    ports:
+      - "5432:5432"
+
+  modified-spliceai-lookup:
+    build:
+      context: .
+      args:
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        http_proxy: ${HTTP_PROXY:-}
+        https_proxy: ${HTTPS_PROXY:-}
+    restart: unless-stopped
+    environment:
+      NUM_THREADS: 20
+      REDIS_HOST: redis-cache
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,redis-cache,postgres,spliceai-37-api,spliceai-38-api}
+    networks:
+      - web-network
+    depends_on:
+      - redis-cache
+    volumes:
+      # Bind-mount the repo so frontend changes apply without rebuilding the image.
+      - .:/app
+
+  redis-cache:
+    image: redis:alpine
+    restart: unless-stopped
+    networks:
+      - web-network
+
+  spliceai-38-api:
+    image: docker.io/weisburd/spliceai-38:latest
+    restart: unless-stopped
+    networks:
+      - web-network
+    ports:
+      - "8038:8080"
+    environment:
+      DATABASE_ENABLED: "1"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: spliceai-lookup-db
+      DB_USER: postgres
+      DB_PASSWORD: ${SPLICEAI_DB_PASSWORD}
+      DISABLE_RATE_LIMIT: "1"
+    depends_on:
+      - postgres
+    # Optional: use the patched server from this repo without rebuilding the image.
+    # Required for SAI-10k exon fallback when PostgreSQL is unavailable; with a
+    # populated transcripts_hg* DB the stock image also works for CDS annotations.
+    volumes:
+      - ./google_cloud_run_services/server.py:/server.py:ro
+      - ./google_cloud_run_services/sai10k_predictions.py:/sai10k_predictions.py:ro
+
+  spliceai-37-api:
+    image: docker.io/weisburd/spliceai-37:latest
+    restart: unless-stopped
+    networks:
+      - web-network
+    ports:
+      - "8037:8080"
+    environment:
+      DATABASE_ENABLED: "1"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: spliceai-lookup-db
+      DB_USER: postgres
+      DB_PASSWORD: ${SPLICEAI_DB_PASSWORD}
+      DISABLE_RATE_LIMIT: "1"
+    depends_on:
+      - postgres
+    volumes:
+      - ./google_cloud_run_services/server.py:/server.py:ro
+      - ./google_cloud_run_services/sai10k_predictions.py:/sai10k_predictions.py:ro
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - modified-spliceai-lookup
+      - spliceai-37-api
+      - spliceai-38-api
+    networks:
+      - web-network
+
+networks:
+  web-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
