@@ -1797,8 +1797,34 @@ const parseVariantsFromVCF = (content) => {
     return variants
 }
 
+const getVcfFileInput = () => document.getElementById("batch-vcf-file")
+
+const vcfFileIsSelected = () => {
+    const fileInput = getVcfFileInput()
+    return !!(fileInput && fileInput.files && fileInput.files.length > 0)
+}
+
+const updateVcfFileUI = () => {
+    const hasFile = vcfFileIsSelected()
+    $("#clear-vcf-file-btn").toggle(hasFile)
+    if (hasFile) {
+        $("#batch-vcf-filename").text(getVcfFileInput().files[0].name).show()
+    } else {
+        $("#batch-vcf-filename").hide().text("")
+    }
+}
+
+/** Clear the VCF file input so textarea variants are used on the next submit. */
+const clearVcfFileInput = () => {
+    const fileInput = getVcfFileInput()
+    if (fileInput) {
+        fileInput.value = ""
+    }
+    updateVcfFileUI()
+}
+
 const resolveVariantListFromInputs = async () => {
-    const fileInput = document.getElementById("batch-vcf-file")
+    const fileInput = getVcfFileInput()
     if (fileInput && fileInput.files && fileInput.files.length > 0) {
         const file = fileInput.files[0]
         const name = file.name.toLowerCase()
@@ -2225,6 +2251,14 @@ $(document).ready(() => {
 
     // init event handlers
     $("#submit-button").click(handleSubmit)
+
+    clearVcfFileInput()
+    window.addEventListener("pageshow", () => {
+        clearVcfFileInput()
+    })
+
+    $("#batch-vcf-file").on("change", updateVcfFileUI)
+    $("#clear-vcf-file-btn").click(clearVcfFileInput)
 
     $("#batch-prev-btn").click(() => { void displayBatchVariantAtIndex(currentBatchIndex - 1) })
     $("#batch-next-btn").click(() => { void displayBatchVariantAtIndex(currentBatchIndex + 1) })
