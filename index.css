@@ -207,3 +207,63 @@ th div {
     background: #2185d0;
     transition: width 0.25s ease;
 }
+/* Per-position score modal (ported from upstream August 2026 UI) */
+#per-position-modal {
+    width: 1150px;
+    max-width: 95vw;
+}
+
+.ui.modal[id^="modal-with-table"] {
+    width: 1150px;
+    max-width: 95vw;
+}
+
+#per-position-modal > .header {
+    padding-right: 15px;
+}
+
+#per-position-header-buttons {
+    float: right;
+    display: flex;
+    gap: 25px;
+}
+
+#per-position-header-buttons > .button {
+    margin: 0;
+}
+
+#per-position-modal-content tbody tr:hover {
+    background-color: #f2f8ff;
+}
+
+#per-position-modal-content thead th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background: #F9FAFB;
+}
+
+#per-position-modal-content {
+    padding-top: 0;
+    max-height: calc(80vh - 10em);
+}
+
+#per-position-modal-content.per-position-centered {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding-bottom: 0;
+    min-height: calc(80vh - 10em);
+}
+
+#per-position-modal-content .ui.loader:before {
+    border-color: rgba(0, 0, 0, 0.1);
+}
+
+#per-position-modal-content .ui.loader:after {
+    border-color: #767676 transparent transparent;
+}
+
+#per-position-modal-content > table {
+    margin-top: 0;
+}

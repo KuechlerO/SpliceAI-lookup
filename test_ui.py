@@ -9,33 +9,46 @@ To run:
 
 To run against a different URL:
     SPLICEAI_LOOKUP_URL=https://spliceailookup.broadinstitute.org python3 -m unittest test_ui -v
+
+These tests exercise whatever is DEPLOYED at SPLICEAI_LOOKUP_URL, not the index.html
+in this working tree. A passing run therefore says nothing about uncommitted local
+changes -- to gate those, serve this directory and point SPLICEAI_LOOKUP_URL at it.
 """
 
 import os
+import re
 import unittest
 
 from playwright.sync_api import sync_playwright, expect
 
 
+# The dev site's own domain, which is where its CNAME now points GitHub Pages. The
+# old broadinstitute.github.io/SpliceAI-lookup-dev URL still redirects here, but
+# pointing at it directly keeps the tests off a redirect and, more importantly, off
+# any future change to what that redirect targets.
 BASE_URL = os.environ.get(
     "SPLICEAI_LOOKUP_URL",
-    "https://broadinstitute.github.io/SpliceAI-lookup-dev/index.html",
+    "https://spliceailookup-dev.broadinstitute.org/index.html",
 )
 
 # Set SPLICEAI_API_ENV=dev to route the frontend's spliceai/pangolin API calls
 # to the 'dev'-tagged Cloud Run revisions deployed by `build_and_deploy.py --dev`.
-# The frontend (index.html) checks the URL hash for apiEnv=<env> at load time;
-# this helper appends it to every page.goto() URL.
+# The frontend (index.html) checks the URL hash for api=<env> at load time; this
+# helper appends it to every page.goto() URL. The name has to be exactly "api":
+# index.html matches /[?&#]api=([^&#]*)/, so the "apiEnv" this used to append was
+# never recognized and the setting silently did nothing -- every call still went to
+# production. That went unnoticed because BASE_URL defaults to the dev site, which
+# index.html detects on its own and routes to dev regardless.
 API_ENV = os.environ.get("SPLICEAI_API_ENV", "")
 
 
 def _build_url(hash_str=""):
-    """Return BASE_URL with apiEnv=<env> merged into the hash when API_ENV is set."""
+    """Return BASE_URL with api=<env> merged into the hash when API_ENV is set."""
     if not API_ENV:
         return BASE_URL + hash_str
     if hash_str.startswith("#"):
-        return f"{BASE_URL}{hash_str}&apiEnv={API_ENV}"
-    return f"{BASE_URL}#apiEnv={API_ENV}"
+        return f"{BASE_URL}{hash_str}&api={API_ENV}"
+    return f"{BASE_URL}#api={API_ENV}"
 
 
 # Max time (ms) to wait for API responses. HGVS variants need VEP
@@ -74,10 +87,10 @@ class TestSpliceAILookupUI(unittest.TestCase):
         """Return the URL fragment (everything after #), or empty string."""
         return self.page.url.split("#", 1)[-1] if "#" in self.page.url else ""
 
-    def _wait_for_submit(self):
+    def _wait_for_submit(self, timeout_ms=TIMEOUT_MS):
         """Wait for the submit button to enter and then exit its loading state."""
         self.page.wait_for_selector("#submit-button.loading", timeout=5_000)
-        self.page.wait_for_selector("#submit-button:not(.loading)", timeout=TIMEOUT_MS)
+        self.page.wait_for_selector("#submit-button:not(.loading)", timeout=timeout_ms)
 
     def _click_label(self, input_selector):
         """Click the Semantic UI label for a hidden checkbox/radio input.
@@ -87,14 +100,14 @@ class TestSpliceAILookupUI(unittest.TestCase):
         """
         self.page.locator(input_selector).locator("xpath=..").locator("label").click()
 
-    def _submit_variant(self, variant, hg="38"):
+    def _submit_variant(self, variant, hg="38", timeout_ms=TIMEOUT_MS):
         """Enter a variant, select genome version, click submit, and wait for completion."""
         if hg == "37":
             self._click_label("input[name='hg'][value='37']")
 
         self.page.fill("#search-box", variant)
         self.page.click("#submit-button")
-        self._wait_for_submit()
+        self._wait_for_submit(timeout_ms)
 
     # ------------------------------------------------------------------
     # Page load
@@ -226,9 +239,12 @@ class TestSpliceAILookupUI(unittest.TestCase):
 
     def test_genome_version_hg37(self):
         """Selecting hg37 and submitting uses hg=37 in the URL hash and shows results."""
-        # Note: 8-140300616-T-G is an hg38 coordinate; we're testing the
-        # hg37 UI workflow, not the biological accuracy of this position.
-        self._submit_variant("8-140300616-T-G", hg="37")
+        # The GRCh37 coordinate for the same variant as the hg38 examples above (the liftover
+        # test_api_consistency.py and expected_scores.json use). It has to be a real hg19 variant:
+        # the backends check the REF allele against the reference genome, so the hg38 coordinate
+        # this used to pass is rejected on hg37 (hg19 8:140300616 is C, not T) and the page shows
+        # that error instead of results.
+        self._submit_variant("8-141310715-T-G", hg="37")
 
         self.assertIn("hg=37", self._get_url_hash())
         self.assertTrue(self.page.is_visible("#response-box"))
@@ -252,11 +268,30 @@ class TestSpliceAILookupUI(unittest.TestCase):
         self.assertIn("mask=1", self._get_url_hash())
 
     def test_gencode_comprehensive_option(self):
-        """Selecting 'comprehensive' gencode set includes bc=comprehensive in the URL hash."""
+        """Selecting 'comprehensive' routes to the comprehensive services and shows results."""
         self._click_label("input[name='gencode-gene-set'][value='comprehensive']")
-        self._submit_variant("8-140300616-T-G")
+        # Double the wait, for the reason test_url_hash_navigation does: the comprehensive gene
+        # set is served by its own low-traffic Cloud Run services, which scale to zero and which
+        # no other test in this suite warms, so this single submit pays two simultaneous cold
+        # starts. At the 60s default that times out here often enough to abort the test before
+        # any assertion below runs, which would hide the routing regressions they exist to catch.
+        self._submit_variant("8-140300616-T-G", timeout_ms=TIMEOUT_MS * 2)
 
         self.assertIn("bc=comprehensive", self._get_url_hash())
+        # The hash is written even when both API calls fail, so assert on the results
+        # themselves: comprehensive is served by its own Cloud Run services now, and a broken
+        # url mapping would otherwise leave this test green while the page showed nothing.
+        # Asserting on score rows rather than on the error box keeps this specific to routing --
+        # the box is also where any variant-resolution message would land.
+        self.assertTrue(self.page.is_visible("#spliceai-table"))
+        self.assertTrue(self.page.is_visible("#pangolin-table"))
+        # Count the row classes the renderer emits, not "tbody tr": both tables are declared
+        # with a <thead> and no <tbody>, and rows are inserted after that <thead> as direct
+        # <table> children, so a "tbody tr" selector matches nothing however healthy routing is.
+        self.assertGreater(len(self.page.query_selector_all("#spliceai-table .spliceai-result-row")), 0,
+                           "comprehensive SpliceAI request returned no score rows")
+        self.assertGreater(len(self.page.query_selector_all("#pangolin-table .pangolin-result-row")), 0,
+                           "comprehensive Pangolin request returned no score rows")
 
     def test_ref_alt_score_columns(self):
         """Enabling REF/ALT scores checkbox shows the REF and ALT score columns."""
@@ -329,12 +364,24 @@ class TestSpliceAILookupUI(unittest.TestCase):
         self._submit_variant("8-140300616-T-G")
 
         self.assertTrue(self.page.is_visible("#other-predictors-table"))
-        table_text = self.page.inner_text("#other-predictors-table")
-        # At least some standard predictors should appear
+        # This table is built off the critical path, so the submit button clearing no longer means
+        # it has rendered. Wait for a row that actually carries a score, not just for any content:
+        # when every lookup fails the table holds only the "... scores are not available for this
+        # variant" row, which names the missing predictors, so waiting on the table's text and
+        # then searching it for predictor names passes on exactly the failure this test exists to
+        # catch. Only a scored row has a "three wide column" cell (index.html's
+        # generateOtherPredictorsTable); the missing-scores row is one "four wide column" spanning
+        # the rest.
+        self.page.wait_for_selector("#other-predictors-table td.three.wide.column",
+                                    timeout=TIMEOUT_MS)
+        # At least some standard predictors should appear, named by a row that has a score
+        labels = " | ".join(self.page.locator(
+            "#other-predictors-table tr:has(td.three.wide.column) td.four.wide.column"
+        ).all_inner_texts())
         found = [p for p in ("CADD", "REVEL", "AlphaMissense", "PrimateAI", "PhyloP")
-                 if p.lower() in table_text.lower()]
+                 if p.lower() in labels.lower()]
         self.assertGreater(len(found), 0,
-                           f"Expected predictor names in other-predictors table, got: {table_text[:300]}")
+                           f"Expected scored predictor rows in other-predictors table, got: {labels[:300]}")
 
     # ------------------------------------------------------------------
     # Score color-coding
@@ -379,6 +426,49 @@ class TestSpliceAILookupUI(unittest.TestCase):
             f"palette: {unexpected} (expected a subset of {known_rgb})",
         )
 
+    def test_score_color_matches_the_displayed_value(self):
+        """Every score is shaded by the 2-decimal number it displays (issue #136).
+
+        Calls index.html's formatScore and getScoreStyle over a sweep of raw scores rather than
+        submitting a variant whose score happens to land just under a cutoff: model output moves
+        between releases, so a fixture variant would stop covering the boundary it was picked for.
+        The reported bug was a raw 0.195 rendering as "0.20" in a cell with no green background.
+        """
+        mismatches = self.page.evaluate("""() => {
+            // The whole style string each function owes the displayed value, not just its
+            // background: below 0.01 getScoreStyle greys the text and paints no background at
+            // all, and comparing only the background would let that branch pass whatever it
+            // returned. getRawScoreStyle is swept too -- it has only the grey branch, but it
+            // reads the same rounded value and would drift the same way.
+            const expectedStyle = (displayed) =>
+                  displayed < 0.01 ? "style='color:#BBBBBB;'"
+                : displayed >= 0.8 ? "style='white-space:nowrap;background-color:#fccfb8;'"
+                : displayed >= 0.5 ? "style='white-space:nowrap;background-color:#fff19d;'"
+                : displayed >= 0.2 ? "style='white-space:nowrap;background-color:#cdffd7;'"
+                : ""
+            const expectedRawStyle = (displayed) => displayed < 0.01 ? "style='color:#BBBBBB;'" : ""
+            const mismatches = []
+            // Negative scores as well as positive: Pangolin reports a real splice loss as a
+            // negative DS_SL, and both functions take the magnitude, so only negative inputs
+            // exercise that.
+            for (let i = -1000; i <= 1000; i++) {
+                const score = i / 1000
+                const displayed = parseFloat(formatScore(score))
+                const style = getScoreStyle(score)
+                const rawStyle = getRawScoreStyle(score)
+                if (style !== expectedStyle(displayed)) {
+                    mismatches.push(["getScoreStyle", score, formatScore(score), style])
+                }
+                if (rawStyle !== expectedRawStyle(displayed)) {
+                    mismatches.push(["getRawScoreStyle", score, formatScore(score), rawStyle])
+                }
+            }
+            return mismatches
+        }""")
+        self.assertEqual(
+            mismatches, [],
+            f"scores shaded inconsistently with the value they display: {mismatches[:5]}")
+
     # ------------------------------------------------------------------
     # Insertion modal dialog
     # ------------------------------------------------------------------
@@ -389,16 +479,126 @@ class TestSpliceAILookupUI(unittest.TestCase):
         # detail view (gain score at position 0).
         self._submit_variant("2-47790924-C-CAGTTG")
 
-        # Look for the modal trigger icon (window maximize outline icon)
-        modal_icons = self.page.query_selector_all("#spliceai-table .window.maximize.outline.icon")
-        if not modal_icons:
-            self.skipTest("No modal icons found for this insertion variant")
+        # Look for the modal trigger icon (table icon with a table-icon<id> id). Assert rather
+        # than skip: this variant is a known trigger, so a missing icon is the regression this
+        # test exists to catch, and skipping would report it as "nothing to check".
+        modal_icons = self.page.query_selector_all("#spliceai-table i[id^='table-icon']")
+        self.assertTrue(modal_icons, "no inserted-bases modal icon for a variant known to produce one")
 
         modal_icons[0].click()
         # A Semantic UI modal should appear with a score table inside
         expect(self.page.locator(".ui.modal.visible")).to_be_visible(timeout=5_000)
         modal_text = self.page.inner_text(".ui.modal.visible")
         self.assertIn("REF acceptor score", modal_text)
+
+    # SCORES_FOR_INSERTED_BASES rows for 16-2317763-T-TACTC (the ABCA3 c.875 insertion),
+    # copied from the spliceai-38 API response and trimmed to the rows that decide the answer.
+    # The API reports the inserted bases with a "+N" offset in pos and the flanking genomic
+    # bases with their real coordinates. Here the gain is at +1 (AA 0.014, which is the
+    # reported DS_AG), while the exon's annotated acceptor at 2317764 scores higher in ALT
+    # (0.980) yet is no gain at all, because REF is just as high (0.987).
+    SCORES_FOR_INSERTED_BASES_ABCA3 = [
+        {"chrom": "chr16", "pos": "2317761", "ref": "A", "alt": "A", "RA": "0.080", "RD": "0.000", "AA": "0.025", "AD": "0.000"},
+        {"chrom": "chr16", "pos": "2317763", "ref": "T", "alt": "T", "RA": "0.000", "RD": "0.000", "AA": "0.000", "AD": "0.000"},
+        {"chrom": "chr16", "pos": "+1", "ref": " ", "alt": "A", "RA": "0.000", "RD": "0.000", "AA": "0.014", "AD": "0.000"},
+        {"chrom": "chr16", "pos": "+2", "ref": " ", "alt": "C", "RA": "0.000", "RD": "0.000", "AA": "0.000", "AD": "0.000"},
+        {"chrom": "chr16", "pos": "+3", "ref": " ", "alt": "T", "RA": "0.000", "RD": "0.000", "AA": "0.000", "AD": "0.000"},
+        {"chrom": "chr16", "pos": "+4", "ref": " ", "alt": "C", "RA": "0.000", "RD": "0.000", "AA": "0.001", "AD": "0.000"},
+        {"chrom": "chr16", "pos": "2317764", "ref": "C", "alt": "C", "RA": "0.987", "RD": "0.000", "AA": "0.980", "AD": "0.000"},
+    ]
+
+    def _position_for_inserted_bases(self, score_key, score, rows):
+        """Return what the results table's position column shows for an insertion's gain.
+
+        Calls index.html's updatePositionAccountingForInsertedBases directly instead of
+        submitting the variant: the rows are the fixture above rather than a live prediction,
+        so the expected string does not move when the model or its annotations are updated.
+        """
+        return self.page.evaluate(
+            f"(rows) => updatePositionAccountingForInsertedBases("
+            f"'{score_key}', '{score}', 0, 'T', 'TACTC', rows)",
+            rows,
+        )
+
+    def test_inserted_base_position_is_an_offset_not_a_coordinate(self):
+        """The gain's offset within the inserted sequence, not a flanking base's coordinate."""
+        # The bug this covers reported "+2317764 bp position within the inserted sequence":
+        # the argmax ran over the flanking genomic rows too and used the raw ALT score, so the
+        # unchanged annotated acceptor next to the insertion won it and its coordinate was
+        # printed as an offset.
+        self.assertEqual(
+            self._position_for_inserted_bases("DS_AG", "0.014", self.SCORES_FOR_INSERTED_BASES_ABCA3),
+            "+1 bp position within the inserted sequence")
+
+    def test_inserted_bases_without_a_gain_keep_the_reported_position(self):
+        """With no gain inside the insertion, the model's own 0 bp offset is left alone."""
+        # Same rows with the one gain inside the inserted sequence zeroed out. The flanking
+        # rows still carry high ALT scores, and none of them may be reported as an offset.
+        rows = [
+            {**row, "AA": "0.000"} if str(row["pos"]).startswith("+") else row
+            for row in self.SCORES_FOR_INSERTED_BASES_ABCA3
+        ]
+        self.assertEqual(self._position_for_inserted_bases("DS_AG", "0.014", rows), "0 bp")
+
+    # ------------------------------------------------------------------
+    # Per-position score table
+    # ------------------------------------------------------------------
+
+    def test_per_position_table_modal(self):
+        """A transcript's table icon opens the per-position score table for that transcript."""
+        self._submit_variant("8-140300616-T-G")
+
+        # A disabled icon marks a transcript with nothing to tabulate: it carries no
+        # data-icon-id and the delegated click handler filters it out.
+        icon = self.page.locator(
+            "#spliceai-table .per-position-table-icon:not(.per-position-table-icon-disabled)").first
+        expect(icon).to_be_visible(timeout=TIMEOUT_MS)
+
+        # Pin the transcript this particular icon belongs to before clicking it. The icon sits
+        # in that transcript's own cell, which also carries the versioned id as link text. This
+        # locus overlaps several transcripts, each with its own icon and its own /scores request,
+        # so asserting only that the heading says "ENST" would stay green if a click opened some
+        # other transcript's table.
+        expected_transcript_id = re.search(
+            r"ENST\d+\.\d+", icon.locator("xpath=ancestor::td[1]").inner_text())
+        self.assertIsNotNone(expected_transcript_id, "no transcript id in the clicked icon's cell")
+
+        icon.click()
+        expect(self.page.locator("#per-position-modal")).to_be_visible(timeout=TIMEOUT_MS)
+        # The rows come from a separate /scores request, and the modal is shown with a spinner
+        # in it while that is in flight, so wait for the table rather than for the modal.
+        self.page.wait_for_selector("#per-position-modal-content table tbody tr", timeout=TIMEOUT_MS)
+
+        self.assertGreater(
+            len(self.page.query_selector_all("#per-position-modal-content table tbody tr")), 0,
+            "per-position table opened with no score rows")
+        self.assertIn(expected_transcript_id.group(0),
+                      self.page.inner_text("#per-position-modal-heading"),
+                      "the modal heading names a different transcript than the icon that was clicked")
+        # The computed delta columns are what the table exists to show. Matching on the plain
+        # words keeps this off the non-ASCII delta character in the rendered header.
+        header_text = self.page.inner_text("#per-position-modal-content thead")
+        self.assertIn("acceptor loss", header_text)
+        self.assertIn("donor loss", header_text)
+        # Both header buttons stay hidden until there is a table to act on, so their appearance
+        # is part of a successful open.
+        self.assertTrue(self.page.is_visible("#per-position-download-button"))
+        self.assertTrue(self.page.is_visible("#per-position-visualize-button"))
+
+    def test_per_position_modal_is_dismissed_by_back_navigation(self):
+        """Browser Back closes the per-position modal instead of leaving stale scores up."""
+        self._submit_variant("8-140300616-T-G")
+
+        icons = self.page.query_selector_all(
+            "#spliceai-table .per-position-table-icon:not(.per-position-table-icon-disabled)")
+        self.assertTrue(icons, "no enabled per-position table icon for a variant with non-zero scores")
+        icons[0].click()
+        self.page.wait_for_selector("#per-position-modal-content table tbody tr", timeout=TIMEOUT_MS)
+
+        # The modal is a top-level overlay rather than part of #response-box, so it is not
+        # covered by the element list the search-reset path hides.
+        self.page.go_back()
+        expect(self.page.locator("#per-position-modal")).to_be_hidden(timeout=TIMEOUT_MS)
 
     # ------------------------------------------------------------------
     # External links in results
@@ -441,6 +641,12 @@ class TestSpliceAILookupUI(unittest.TestCase):
         """HGVS variant shows a VEP consequence link in the results."""
         self._submit_variant("NM_001089.3:c.875A>T")
 
+        # The consequence cells are filled in after the tables render, so the submit button
+        # clearing says nothing about whether they have been written yet. Wait for the cell
+        # itself rather than reading the table the moment the spinner stops.
+        self.page.wait_for_selector(
+            "#spliceai-table .transcript-consequence a[href*='predicted_data']",
+            timeout=TIMEOUT_MS)
         spliceai_html = self.page.inner_html("#spliceai-table")
         # The consequence should link to Ensembl's predicted_data page
         self.assertIn("ensembl.org/info/genome/variation/prediction", spliceai_html,
@@ -509,6 +715,174 @@ class TestSpliceAILookupUI(unittest.TestCase):
 
         # After the request completes, loading class should be removed.
         self.page.wait_for_selector("#submit-button:not(.loading)", timeout=TIMEOUT_MS)
+
+    # ------------------------------------------------------------------
+    # Position-only (REF-only) mode
+    #
+    # A bare chrom:position input (no ref/alt) asks for scores computed on the
+    # reference sequence alone. There is no ALT allele, so everything that
+    # depends on one -- delta scores, SAI-10k-calc, the other-predictors table,
+    # the REF/ALT score columns -- must be suppressed, and the shared table
+    # headers get relabeled in place. The relabeling mutates elements that the
+    # normal delta-score path reuses, so the tests below also cover switching
+    # back out of the mode.
+    # ------------------------------------------------------------------
+
+    def test_position_only_shows_ref_score_tables(self):
+        """A bare chrom:position returns SpliceAI and Pangolin reference scores."""
+        self._submit_variant("chr8:140300616")
+
+        self.assertTrue(self.page.is_visible("#response-box"))
+        # Row counts alone would pass with both tables hidden, since the rows stay
+        # in the DOM either way.
+        self.assertTrue(self.page.is_visible("#spliceai-table"))
+        self.assertTrue(self.page.is_visible("#pangolin-table"))
+        self.assertGreater(len(self.page.query_selector_all(".spliceai-result-row")), 0,
+                           "Expected at least one SpliceAI REF-only result row")
+        self.assertGreater(len(self.page.query_selector_all(".pangolin-result-row")), 0,
+                           "Expected at least one Pangolin REF-only result row")
+
+    def test_position_only_relabels_table_headers(self):
+        """The shared delta-score headers are relabeled for REF-only results."""
+        self._submit_variant("chr8:140300616")
+
+        for tool in ("spliceai", "pangolin"):
+            with self.subTest(tool=tool):
+                self.assertEqual(self.page.inner_text(f"#{tool}-variant-header").strip(), "Position")
+                self.assertEqual(self.page.inner_text(f"#{tool}-type-header-label").strip(), "site type")
+                self.assertEqual(self.page.inner_text(f"#{tool}-score-header-label").strip(), "REF score")
+
+    def test_position_only_hides_alt_dependent_sections(self):
+        """SAI-10k-calc and the other-predictors table both need an ALT allele."""
+        self._submit_variant("chr8:140300616")
+
+        # Establish that the search actually succeeded first. Both elements asserted below
+        # are also hidden when the REF-only request errors out and nothing renders, so
+        # without this the test stays green against a completely broken endpoint.
+        self.assertTrue(self.page.is_visible("#spliceai-table"))
+        self.assertGreater(len(self.page.query_selector_all(".spliceai-result-row")), 0,
+                           "REF-only search returned no rows, so the assertions below prove nothing")
+
+        self.assertFalse(self.page.is_visible("#sai10k-table"),
+                         "SAI-10k-calc predictions require an ALT allele and should be hidden")
+        self.assertFalse(self.page.is_visible("#other-predictors-table"),
+                         "Other-predictors scores require an ALT allele and should be hidden")
+
+    def test_position_only_hides_ref_alt_columns_even_when_requested(self):
+        """The REF/ALT columns stay hidden in REF-only mode regardless of the checkbox.
+
+        The checkbox is disabled on entering the mode but keeps whatever value the
+        user set beforehand, so the column toggle has to check the mode too.
+        """
+        self._click_label("input[name='show-ref-alt']")
+        self._submit_variant("chr8:140300616")
+
+        self.assertTrue(self.page.locator("input[name='show-ref-alt']").is_checked(),
+                        "Precondition: the REF & ALT scores checkbox should still be checked")
+        expect(self.page.locator("#spliceai-table th.ref-score-column")).to_be_hidden()
+        expect(self.page.locator("#spliceai-table th.alt-score-column")).to_be_hidden()
+
+    def test_position_only_disables_inapplicable_controls(self):
+        """Controls that have no effect without an ALT allele are disabled."""
+        self._submit_variant("chr8:140300616")
+
+        for name in ("mask", "show-ref-alt", "igv-spliceai-delta-scores", "igv-pangolin-delta-scores"):
+            with self.subTest(name=name):
+                self.assertTrue(self.page.locator(f"input[name='{name}']").is_disabled(),
+                                f"Expected '{name}' to be disabled in position-only mode")
+
+        # The delta-track checkboxes are also unchecked, so they don't look
+        # active for a track that isn't being rendered.
+        for name in ("igv-spliceai-delta-scores", "igv-pangolin-delta-scores"):
+            with self.subTest(name=name):
+                self.assertFalse(self.page.locator(f"input[name='{name}']").is_checked(),
+                                 f"Expected '{name}' to be unchecked in position-only mode")
+
+    def test_position_only_relabels_igv_track_checkboxes(self):
+        """The variant track becomes a reference-position track and the REF/ALT track drops ALT."""
+        self._submit_variant("chr8:140300616")
+
+        self.assertEqual(
+            self.page.locator("input[name='igv-variant']").locator("xpath=..").locator("label").inner_text().strip(),
+            "Ref. position")
+        self.assertEqual(
+            self.page.locator("input[name='igv-spliceai-ref-alt']").locator("xpath=..").locator("label").inner_text().strip(),
+            "SpliceAI REF scores")
+
+    def test_normal_search_after_position_only_restores_the_ui(self):
+        """Switching back to a real variant undoes every position-only change.
+
+        The headers, tooltips and controls are shared between the two modes, so a
+        position-only search leaves them mutated until the next normal search
+        puts them back.
+        """
+        self._submit_variant("chr8:140300616")
+        self._submit_variant("8-140300616-T-G")
+
+        self.assertEqual(self.page.inner_text("#spliceai-variant-header").strip(), "Variant")
+        self.assertIn("score", self.page.inner_text("#spliceai-score-header-label").lower())
+        self.assertNotIn("REF score", self.page.inner_text("#spliceai-score-header-label"))
+        self.assertTrue(self.page.is_visible("#sai10k-table"),
+                        "SAI-10k-calc should reappear for a variant with an ALT allele")
+        self.assertTrue(self.page.is_visible("#other-predictors-table"),
+                        "Other-predictors should reappear for a variant with an ALT allele")
+        self.assertFalse(self.page.locator("input[name='mask']").is_disabled())
+        self.assertEqual(
+            self.page.locator("input[name='igv-variant']").locator("xpath=..").locator("label").inner_text().strip(),
+            "variant track")
+
+    def test_delta_track_checkbox_state_survives_position_only_mode(self):
+        """A delta-track checkbox forced off by position-only mode is restored afterwards.
+
+        Position-only unchecks these while disabling them, which is not the user's
+        preference — it must not leak into the restored state (or into the
+        localStorage the next page load reads).
+        """
+        self.assertTrue(self.page.locator("input[name='igv-spliceai-delta-scores']").is_checked(),
+                        "Precondition: the SpliceAI delta-track checkbox starts checked")
+
+        self._submit_variant("chr8:140300616")
+        self.assertFalse(self.page.locator("input[name='igv-spliceai-delta-scores']").is_checked())
+
+        self._submit_variant("8-140300616-T-G")
+        self.assertTrue(self.page.locator("input[name='igv-spliceai-delta-scores']").is_checked(),
+                        "The pre-position-only checked state should be restored")
+
+    def test_position_only_accepts_alternate_separators(self):
+        """Space- and dash-separated positions are recognized, like the variant formats.
+
+        Each separator gets a freshly loaded page. Sharing one page would let a
+        submission that silently did nothing inherit the previous separator's
+        "Position" header and pass.
+        """
+        for position in ("chr8 140300616", "chr8-140300616"):
+            with self.subTest(position=position):
+                # Via about:blank, because _build_url() can differ from the current
+                # URL only in its fragment (after a submit rewrites the hash), and a
+                # fragment-only goto does not reload the document.
+                self.page.goto("about:blank")
+                self.page.goto(_build_url(), wait_until="domcontentloaded")
+                self._submit_variant(position)
+
+                self.assertEqual(self.page.inner_text("#spliceai-variant-header").strip(), "Position",
+                                 f"'{position}' should be recognized as a position-only query")
+                # Proves this page actually rendered REF-only results, rather than
+                # carrying over a header left behind by an earlier submission. The
+                # position cell echoes the query exactly as it was typed.
+                self.assertIn(position, self.page.inner_text("#spliceai-table"),
+                              f"'{position}' should render results for the queried position")
+
+    def test_full_variant_is_not_treated_as_position_only(self):
+        """A well-formed variant must stay on the delta-score path.
+
+        handleSubmit tests POSITION_ONLY_RE first and never consults VARIANT_RE, so
+        the only thing keeping a full variant off the REF-only path is that pattern's
+        end anchor -- the trailing -REF-ALT leaves it unsatisfied.
+        """
+        self._submit_variant("8-140300616-T-G")
+
+        self.assertEqual(self.page.inner_text("#spliceai-variant-header").strip(), "Variant")
+        self.assertTrue(self.page.is_visible("#other-predictors-table"))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+
+"""Delete old images from one Artifact Registry package, keeping the most recent few.
+
+Every deploy pushes a new image, and nothing used to remove the old ones, so the repo had grown
+to 217 images / 278 GB by 2026-09-01. This is run as the last step of each deploy job (see
+.github/workflows/deploy-on-tag.yml) so the repo stays small on its own.
+
+This registry repo is shared with the liftover service, which deploys from the separate
+broadinstitute/liftover repo and prunes its own images with a copy of this file at
+service/cleanup_old_images.py there. The two copies are the same script; change one and change
+the other. Each deploy only ever prunes its own --package, so the two never touch each other's
+images.
+
+What it keeps:
+
+  - the newest --keep images in the package, so a recent deploy can still be rolled back,
+  - every image a Cloud Run revision in some service's traffic block points at, whatever its age,
+    and
+  - each service's newest superseded revision, which is what a one-command rollback needs.
+
+The second rule is the one that matters. Production and the no-traffic "dev" revision can sit on
+very different images: on 2026-09-01 liftover served production from a 2026-05-12 image while its
+dev revision ran one built that afternoon. A plain "newest N" rule would have deleted the image
+production was serving after a few more dev-only tags, leaving a service that cannot start a new
+container. Pinning the traffic block covers both the production and the dev revision of every
+service, since `gcloud run deploy --tag dev --no-traffic` leaves the dev revision listed there at
+0 percent.
+
+The third rule exists because the first two leave a gap right after a deploy: the traffic block
+then names only the revision just created, so the image the previous revision runs has nothing
+protecting it and is the oldest of the recent builds, i.e. first in line for the newest-N rule.
+That is the image a rollback needs. On 2026-09-07 a cleanup run 20 minutes after a deploy would
+have deleted it at every --keep value.
+
+Deleting an image now only breaks revisions older than the one a rollback would reach for, which
+would have to be rolled back to explicitly by name.
+
+Examples:
+  ./cleanup_old_images.py --package spliceai-38
+  ./cleanup_old_images.py --package pangolin-37 --keep 5
+  ./cleanup_old_images.py --package liftover --dry-run
+"""
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+GCLOUD_PROJECT = "spliceai-lookup-412920"
+REGION = "us-central1"
+REPO = f"{REGION}-docker.pkg.dev/{GCLOUD_PROJECT}/docker"
+
+
+def gcloud_json(args):
+    """Run a gcloud command with --format=json and return the parsed output.
+
+    Args:
+        args (list): gcloud arguments, without the leading "gcloud" or the project/region flags.
+
+    Returns:
+        The parsed JSON, or None if the command failed.
+    """
+    proc = subprocess.run(
+        ["gcloud"] + args + [f"--project={GCLOUD_PROJECT}", "--format=json"],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        error = proc.stderr.strip().splitlines()
+        print(f"  WARNING: `gcloud {' '.join(args)}` failed: {error[-1] if error else 'unknown error'}")
+        return None
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        print(f"  WARNING: `gcloud {' '.join(args)}` returned output that isn't JSON")
+        return None
+
+
+def digests_recorded_in_repo():
+    """Return the image digests this repo's sha256 files name, so cleanup never deletes one.
+
+    A deploy records the digest it pushed and a later plain `deploy` re-reads that file to
+    redeploy the same image, so a digest named there is still reachable even when no Cloud Run
+    revision points at it and it has aged past the --keep window. Deleting it would leave the
+    documented deploy command referring to an image that no longer exists.
+
+    Globbed rather than hard-coded so the copy of this script in the liftover repo (see the
+    module docstring) needs no change: this repo keeps docker/<tool>/sha256_grch<hg>.txt and
+    liftover keeps a single sha256.txt, and both sit under the directory holding this script.
+    Missing files are not an error -- a checkout that never deployed has none.
+    """
+    digests = set()
+    for path in sorted(pathlib.Path(__file__).resolve().parent.glob("**/sha256*.txt")):
+        try:
+            text = path.read_text()
+        except OSError as e:
+            print(f"  WARNING: could not read {path}: {e}")
+            continue
+        digests.update(re.findall(r"sha256:[0-9a-f]{64}", text))
+    return digests
+
+
+def pinned_digests():
+    """Return the set of image digests that some Cloud Run revision is currently serving.
+
+    Covers every service in the region rather than just the ones built from the package being
+    cleaned, so that a service sharing an image (spliceai-38 and spliceai-38-comprehensive run
+    the same one) pins it too. An image in here is never deleted, however old it is.
+
+    Returns:
+        set: "sha256:..." digest strings, or None if the services can't be listed or any of
+            their revisions can't be described. A revision that can't be described may be the
+            only one serving some image, so a partial answer is no answer: the caller treats
+            None as a reason to do nothing rather than to delete unpinned images.
+    """
+    services = gcloud_json(["run", "services", "list", f"--region={REGION}"])
+    if not services:
+        return None
+
+    revision_names = set()
+    for service in services:
+        for entry in service.get("status", {}).get("traffic", []):
+            if entry.get("revisionName"):
+                revision_names.add(entry["revisionName"])
+
+    digests = set()
+    for name in sorted(revision_names):
+        revision = gcloud_json(["run", "revisions", "describe", name, f"--region={REGION}"])
+        if not revision:
+            return None
+        for container in revision.get("spec", {}).get("containers", []):
+            if "@sha256:" in container.get("image", ""):
+                digests.add(container["image"].split("@", 1)[1])
+    return digests
+
+
+def rollback_digests():
+    """Return each service's rollback image: the newest revision it is NOT currently serving.
+
+    pinned_digests only covers the traffic block, which names what is serving right now. A
+    cleanup run straight after a deploy therefore deletes the image the previous revision runs,
+    and that is precisely the image wanted when a deploy misbehaves: `gcloud run services
+    update-traffic --to-revisions=<previous>=100` cannot start a container once its image is
+    gone. Nothing else protects it, since the newest-N rule sorts by build date and the
+    superseded image is by definition the older one.
+
+    Keeping it costs one image per service and it stops being kept as soon as the next deploy
+    makes it the second-newest superseded revision rather than the first.
+
+    Returns:
+        set: "sha256:..." digest strings, empty when every revision of every service is in its
+            traffic block. None if the services or the revisions can't be listed, which the
+            caller treats the way it treats a None from pinned_digests: a partial answer is a
+            reason to delete nothing rather than to delete what could not be checked.
+    """
+    services = gcloud_json(["run", "services", "list", f"--region={REGION}"])
+    if not services:
+        return None
+
+    serving = set()
+    for service in services:
+        for entry in service.get("status", {}).get("traffic", []):
+            if entry.get("revisionName"):
+                serving.add(entry["revisionName"])
+
+    revisions = gcloud_json(["run", "revisions", "list", f"--region={REGION}"])
+    if revisions is None:
+        return None
+
+    # One list call covers every service in the region, matching pinned_digests' reach, so a
+    # service sharing an image has its rollback target kept too.
+    newest_superseded = {}
+    for revision in revisions:
+        metadata = revision.get("metadata", {})
+        name = metadata.get("name")
+        service = metadata.get("labels", {}).get("serving.knative.dev/service")
+        created = metadata.get("creationTimestamp", "")
+        if not name or not service or name in serving:
+            continue
+        if created > newest_superseded.get(service, ("", None))[0]:
+            newest_superseded[service] = (created, revision)
+
+    digests = set()
+    for _, revision in newest_superseded.values():
+        for container in revision.get("spec", {}).get("containers", []):
+            if "@sha256:" in container.get("image", ""):
+                digests.add(container["image"].split("@", 1)[1])
+    return digests
+
+
+def images_to_delete(images, pinned, keep):
+    """Pick the images to delete: everything except the newest `keep` and the pinned ones.
+
+    Tagged images are kept too. Nothing here tags anything but "latest", which is always on a
+    recent image anyway, but an image someone tagged by hand is one someone wanted to keep.
+
+    Args:
+        images (list): image dicts as `gcloud artifacts docker images list` returns them.
+        pinned (set): digests that a Cloud Run revision is serving, from pinned_digests().
+        keep (int): how many of the newest images to keep regardless.
+
+    Returns:
+        list: the image dicts to delete, oldest first.
+    """
+    newest_first = sorted(images, key=lambda i: i["createTime"], reverse=True)
+    keepers = {i["version"] for i in newest_first[:keep]}
+    keepers |= {i["version"] for i in newest_first if i["version"] in pinned or i.get("tags")}
+    return [i for i in reversed(newest_first) if i["version"] not in keepers]
+
+
+def delete_images(package, images):
+    """Delete the given images by digest. Returns the number that could not be deleted.
+
+    Failures are retried once, because a multi-arch image's child manifests can only be deleted
+    after the parent manifest that references them, and nothing in the order they are deleted in
+    puts the parent first: the two are pushed together and share a timestamp.
+    """
+    remaining = list(images)
+    for attempt in (1, 2):
+        if attempt == 2:
+            if not remaining:
+                break
+            print(f"  retrying {len(remaining)} image(s) that failed the first pass")
+        still_failing = []
+        for image in remaining:
+            reference = f"{REPO}/{package}@{image['version']}"
+            proc = subprocess.run(
+                ["gcloud", "artifacts", "docker", "images", "delete", reference,
+                 f"--project={GCLOUD_PROJECT}", "--quiet"],
+                capture_output=True, text=True)
+            if proc.returncode != 0:
+                still_failing.append(image)
+                if attempt == 2:
+                    error = proc.stderr.strip().splitlines()
+                    print(f"  FAILED {image['version'][:19]}: {error[-1] if error else 'unknown error'}")
+        remaining = still_failing
+    return len(remaining)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-p", "--package", required=True,
+                        help=f"Image package to clean up within {REPO}, eg. spliceai-38")
+    parser.add_argument("-k", "--keep", type=int, default=3,
+                        help="How many of the newest images to keep, on top of every image a "
+                             "Cloud Run revision is serving")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="Print what would be deleted without deleting it")
+    args = parser.parse_args()
+
+    if args.keep < 1:
+        parser.error("--keep must be at least 1")
+
+    images = gcloud_json(["artifacts", "docker", "images", "list", f"{REPO}/{args.package}",
+                          "--include-tags"])
+    if images is None:
+        print("ERROR: couldn't list the images, so nothing was deleted")
+        return 1
+    print(f"{REPO}/{args.package}: {len(images)} images")
+
+    # None means the Cloud Run API didn't answer for the services or for one of their revisions,
+    # not that nothing is deployed. Deleting on the strength of that would take the newest-N rule
+    # as the only protection and could delete an image production is serving, so stop instead.
+    pinned = pinned_digests()
+    if not pinned:
+        print("ERROR: couldn't read what Cloud Run is serving, so nothing was deleted")
+        return 1
+    print(f"{len(pinned)} image(s) are being served by a Cloud Run revision and will be kept")
+
+    recorded = digests_recorded_in_repo()
+    if recorded:
+        print(f"{len(recorded)} image(s) are named by this repo's sha256 files and will be kept")
+
+    # Same reasoning as the pinned check above: a partial answer here would let the newest-N
+    # rule delete the image a rollback needs, which is the one image worth having when a deploy
+    # has just gone wrong.
+    rollback = rollback_digests()
+    if rollback is None:
+        print("ERROR: couldn't read which revisions a rollback would need, so nothing was deleted")
+        return 1
+    if rollback:
+        print(f"{len(rollback)} image(s) are a service's newest superseded revision "
+              f"(its rollback target) and will be kept")
+
+    doomed = images_to_delete(images, pinned | recorded | rollback, args.keep)
+    if not doomed:
+        print("nothing to delete")
+        return 0
+
+    for image in doomed:
+        print(f"  {'would delete' if args.dry_run else 'deleting'} "
+              f"{image['createTime'][:10]}  {image['version'][:19]}")
+    if args.dry_run:
+        print(f"dry run: {len(doomed)} image(s) would be deleted, "
+              f"{len(images) - len(doomed)} kept")
+        return 0
+
+    failures = delete_images(args.package, doomed)
+    print(f"deleted {len(doomed) - failures} of {len(doomed)} image(s), "
+          f"{len(images) - len(doomed)} kept")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

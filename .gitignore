@@ -4,6 +4,13 @@
 *.json*
 *.chain.gz*
 
+# The recorded score baseline that test_api_consistency.py compares against, tracked so a
+# regression is caught against the same reference for everyone rather than against whatever
+# each checkout happened to capture locally. Anchored to the repo root, and deliberately a
+# single-file exception to the *.json* rule above: that rule is what keeps gcp_sa_key.json
+# out of the repo, so it must stay.
+!/expected_scores.json
+
 service.backup_copy.yaml
 
 .pgpass
@@ -154,3 +161,18 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# macOS Finder metadata
+.DS_Store
+
+# Docker build context: reference genomes and Gencode annotations (~1.7GB), fetched from
+# gs://spliceai-lookup-reference-data by the deploy workflow rather than committed. Most of
+# the individual files already match the patterns above; this ignores the directories so the
+# tree does not show up as untracked.
+google_cloud_run_services/docker/ref/
+google_cloud_run_services/docker/spliceai/annotations/
+google_cloud_run_services/docker/pangolin/annotations/
+
+# Artifacts written by /code-review-local and by Playwright's MCP server
+.code_review_local/
+.playwright-mcp/

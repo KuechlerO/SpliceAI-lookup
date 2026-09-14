@@ -21,8 +21,24 @@ RUN apt update && apt-get install --no-install-recommends -y build-essential lib
 COPY docker/spliceai/requirements.txt /
 RUN python3 -m pip install --upgrade -r /requirements.txt
 
-ARG RANDOM=2
-RUN python3 -m pip install https://github.com/bw2/SpliceAI/archive/refs/heads/master.zip
+# Pinned to a commit, not refs/heads/master: an unpinned URL meant every rebuild silently
+# adopted whatever was on master at that moment, so an unrelated deploy could change the scores
+# the service returns. That is not hypothetical -- SpliceAI raised its reported score precision
+# from 2 to 3 decimals on 2026-08-10, which shifted values like 0.925 across the 2-decimal
+# rounding boundary relative to a production image built three days earlier.
+#
+# Bump this deliberately when you want new model code, and re-run test_api_consistency.py
+# against the dev deployment afterwards. Changing the SHA changes the URL, which is what
+# invalidates the build cache for this layer -- the ARG RANDOM cache-buster that used to be
+# needed for that is gone.
+ARG SPLICEAI_COMMIT=5c0bd57a6c3b9c9d87a3bca5fe417db28e6d11fb
+RUN python3 -m pip install https://github.com/bw2/SpliceAI/archive/${SPLICEAI_COMMIT}.zip
+
+# Carried into the container so server.py can mix it into the response cache key. Bumping the
+# pin above therefore retires the cached scores the previous model computed, without anyone
+# having to also bump CACHE_VERSION by hand -- a step whose omission failed silently, leaving
+# the service serving the retired model's scores.
+ENV MODEL_COMMIT=${SPLICEAI_COMMIT}
 
 ARG WORKERS="2"
 ARG GENOME_VERSION="unknown"
@@ -59,4 +75,10 @@ ENV RUNNING_ON_GOOGLE_CLOUD_RUN=1
 # instead of being killed. Trade-off: a sync worker (1 of WORKERS) is tied up for up to 870s
 # on such a request, lowering the instance's effective concurrency while it runs.
 # --graceful-timeout gives in-flight requests 30s to finish on restart.
-CMD exec gunicorn --preload --bind :$PORT --workers ${WORKERS} --threads 1 --timeout 870 --graceful-timeout 30 server:app
+#
+# No --preload: server.py loads its annotator at import, and with --preload that import runs in
+# the arbiter before it forks, so every worker would inherit one pyfastx sqlite handle and one
+# TensorFlow runtime. Neither survives fork() -- every inference hung until --timeout killed the
+# worker. Without --preload gunicorn imports the module separately in each worker after the
+# fork, so each builds its own. See preload_models() in server.py.
+CMD exec gunicorn --bind :$PORT --workers ${WORKERS} --threads 1 --timeout 870 --graceful-timeout 30 server:app

@@ -8,9 +8,11 @@ name: Build and deploy to Cloud Run on tag
 #   - A tag whose name contains "dev" (e.g. v1.2.3-dev) updates ONLY the dev
 #     revision, leaving production serving its current revision.
 #
-# Each of the 4 services (spliceai/pangolin x GRCh37/GRCh38) is built and
-# deployed in its own matrix job so the heavy ref data + image fit on a stock
-# GitHub-hosted runner and the 4 deploys run in parallel.
+# Each of the 4 images (spliceai/pangolin x GRCh37/GRCh38) is built in its own matrix job so
+# the heavy ref data + image fit on a stock GitHub-hosted runner and the 4 builds run in
+# parallel. Each job then deploys that one image twice, once per Gencode gene set, for 8
+# services in total: the un-suffixed ones serve GENE_SET=basic and the "-comprehensive" ones
+# serve GENE_SET=comprehensive. The gene set is an env var, so it needs no separate image.
 on:
   push:
     tags:
@@ -152,9 +154,27 @@ jobs:
 
           # Update production only when the tag does NOT contain "dev". Run this
           # last so the final --to-latest routes traffic to the prod revision.
+          #
+          # --promote deploys the digest the dev step above just recorded, rather than building
+          # a second time. Two builds from one checkout are not guaranteed to produce the same
+          # image (the Dockerfile base tag and the unpinned Flask/gunicorn requirements both
+          # resolve to whatever is current), so rebuilding here could put an image into
+          # production that the dev revision never was. It also halves the job's build time.
           if [[ "${GITHUB_REF_NAME}" == *dev* ]]; then
             echo "Tag '${GITHUB_REF_NAME}' contains 'dev' -> dev revision only, leaving production unchanged."
           else
-            echo "Tag '${GITHUB_REF_NAME}' -> updating production as well."
-            python3 build_and_deploy.py -t "$TOOL" -g "$GENOME"
+            echo "Tag '${GITHUB_REF_NAME}' -> promoting the image just deployed to dev."
+            python3 build_and_deploy.py -t "$TOOL" -g "$GENOME" --promote
           fi
+
+      # Every deploy pushes another image and none were ever removed, so the repo had reached
+      # 217 images / 278 GB before this step existed. Each matrix cell prunes only the package
+      # it just pushed to, so the four parallel jobs never touch each other's images.
+      #
+      # Runs after the deploy, not before, so the image this job just deployed is already among
+      # the newest ones kept, and so a cleanup that fails can't stop a deploy that would have
+      # worked. cleanup_old_images.py keeps every image Cloud Run is serving whatever its age,
+      # so this cannot delete what production or the dev revision is running.
+      - name: Delete old images from Artifact Registry
+        continue-on-error: true
+        run: python3 cleanup_old_images.py --package "${{ matrix.tool }}-${{ matrix.genome }}" --keep 3

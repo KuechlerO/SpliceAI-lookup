@@ -13,11 +13,22 @@ To run the consistency tests:
 
 The --capture step writes expected_scores.json. The test step loads it
 and compares each variant's scores against the snapshot.
+
+Note on the first run after a model re-pin: the pinned model commit is part of the
+response cache key (MODEL_COMMIT in server.py), so re-pinning retires every cached
+entry and each of these queries recomputes instead of being served from cache. A
+computed request counts against the per-IP rate limit and a cached one does not, so
+that first run costs 82 computed requests against a budget of 150 per 7 minutes: 76
+for the recorded variants and 6 for TestEquivalentSpellings, whose padded spellings are
+then served from the cache entries their shortest spellings just filled (up to 90 when a
+result can't be cached). It fits, and it also repopulates what it recomputed, so a later
+identical run is served from cache and costs nothing again.
 """
 
 import json
 import os
 import sys
+import time
 import unittest
 
 import requests
@@ -43,6 +54,50 @@ API_URLS = {
 }
 
 TRANSCRIPT_PRIORITY = {"MS": 3, "MP": 2, "C": 1, "N": 0}
+
+# Largest delta-score difference still treated as a match. Scores are compared after rounding
+# to 2 decimals, so a model whose own output precision changes (bw2/SpliceAI and bw2/Pangolin
+# raised theirs from 2 to 3 decimals in Aug 2026) shifts a value like 0.925 to either 0.92 or
+# 0.93 depending on which side of the boundary it lands. That is a reporting difference, not a
+# scoring regression, and this tolerance is what keeps it from being reported as one. Anything
+# larger is a real change in what the model predicts.
+SCORE_TOLERANCE = 0.01
+
+# Substrings of the API error messages that mean "there is genuinely nothing to score at this
+# variant". Those are a property of the variant, so --capture records them and the test skips
+# that variant from then on. Every other failure -- a rate-limit rejection, a 5xx, a dropped
+# connection -- is a property of the moment, and recording one would bake a permanent skip into
+# the baseline for a variant that is fine. An earlier capture that tripped the rate limiter wrote
+# 20 such entries into the baseline, which is what motivated this split; the baseline was
+# re-captured afterwards and now has none.
+CAPTURABLE_ERROR_MARKERS = (
+    "did not return any scores",
+    "unable to compute",
+)
+
+# Seconds between capture queries. The API restricts an IP that logs 150 computed requests
+# within 7 minutes (exceeds_rate_limit in server.py). A capture on its own is 38 variants x 2
+# tools = 76 requests, which cannot reach 150 however it is paced, so the delay is not what
+# makes a lone capture safe. What it protects is a capture started right after a full test run
+# from the same IP, where that run's own requests are still inside the window: 82, or up to 90
+# when a result can't be cached (see the note at the top), and 90 + 76 = 166 would trip the
+# limit. At this spacing the capture issues at most 53 requests inside any 7-minute window
+# (420/8 = 52.5 intervals, plus the request that opens the window), so the worst case is
+# 90 + 53 = 143 and the test run's burst ages out before the limit is reached. Seven seconds
+# left no margin once a third equivalent-spelling group brought a test run to 90 (90 + 60 = 150,
+# and the check is >= 150), six seconds allowed 70, and three seconds allowed 140.
+CAPTURE_DELAY_SECONDS = 8
+
+
+def scores_match(actual, expected):
+    """Whether two rounded delta scores are within SCORE_TOLERANCE of each other.
+
+    The difference is rounded before the comparison because binary floating point cannot hold
+    2-decimal values exactly: abs(0.93 - 0.92) evaluates to 0.010000000000000009, which a plain
+    `<= 0.01` would reject -- rejecting precisely the off-by-one-hundredth case this exists to
+    accept.
+    """
+    return round(abs(actual - expected), 6) <= SCORE_TOLERANCE
 
 EXPECTED_SCORES_PATH = os.path.join(os.path.dirname(__file__) or ".", "expected_scores.json")
 
@@ -223,38 +278,42 @@ def extract_scores(transcript, tool):
 
 
 def _capture_variant(expected, variant, hg, tool, label):
-    """Capture scores for one (variant, hg, tool) combination."""
+    """Capture scores for one (variant, hg, tool) combination.
+
+    Raises on any failure that is a property of the moment rather than of the variant, so a
+    capture that hits the rate limiter or a transport error fails loudly instead of writing a
+    baseline that silently skips those variables forever. See CAPTURABLE_ERROR_MARKERS.
+    """
     key = f"{variant}|{hg}|{tool}"
-    try:
-        # Resolve HGVS variants
-        actual_variant = variant
-        if variant.startswith("HGVS:"):
-            hgvs_string = variant[len("HGVS:"):]
-            print(f"  Normalizing {hgvs_string} for hg{hg} ...")
-            actual_variant = normalize_hgvs(hgvs_string, hg)
-            print(f"    -> {actual_variant}")
+    actual_variant = variant
+    if variant.startswith("HGVS:"):
+        hgvs_string = variant[len("HGVS:"):]
+        print(f"  Normalizing {hgvs_string} for hg{hg} ...")
+        actual_variant = normalize_hgvs(hgvs_string, hg)
+        print(f"    -> {actual_variant}")
 
-        print(f"  Querying {tool} hg{hg} for {actual_variant} ({label}) ...")
-        response = query_api(tool, hg, actual_variant)
-        if response.get("error"):
-            print(f"    API error: {response['error']}")
-            expected[key] = {"error": response["error"]}
-            return
+    print(f"  Querying {tool} hg{hg} for {actual_variant} ({label}) ...")
+    response = query_api(tool, hg, actual_variant)
+    if response.get("error"):
+        if not any(marker in response["error"].lower() for marker in CAPTURABLE_ERROR_MARKERS):
+            raise RuntimeError(
+                f"{key}: the API failed for a reason that is not a property of this variant, so "
+                f"the capture is aborting rather than recording it: {response['error']}")
+        print(f"    API error: {response['error']}")
+        expected[key] = {"error": response["error"]}
+        return
 
-        top = get_top_transcript(response.get("scores", []), tool)
-        if not top:
-            print(f"    No transcripts returned")
-            expected[key] = {"error": "no transcripts"}
-            return
+    top = get_top_transcript(response.get("scores", []), tool)
+    if not top:
+        print(f"    No transcripts returned")
+        expected[key] = {"error": "no transcripts"}
+        return
 
-        scores = extract_scores(top, tool)
-        if variant.startswith("HGVS:"):
-            scores["resolved_variant"] = actual_variant
-        expected[key] = scores
-        print(f"    {scores}")
-    except Exception as e:
-        print(f"    ERROR: {e}")
-        expected[key] = {"error": str(e)}
+    scores = extract_scores(top, tool)
+    if variant.startswith("HGVS:"):
+        scores["resolved_variant"] = actual_variant
+    expected[key] = scores
+    print(f"    {scores}")
 
 
 def capture_expected_scores():
@@ -263,6 +322,7 @@ def capture_expected_scores():
     for variant, hg, label in VARIANTS:
         for tool in ("spliceai", "pangolin"):
             _capture_variant(expected, variant, hg, tool, label)
+            time.sleep(CAPTURE_DELAY_SECONDS)
 
     with open(EXPECTED_SCORES_PATH, "w") as f:
         json.dump(expected, f, indent=2, sort_keys=True)
@@ -293,7 +353,12 @@ class TestAPIConsistency(unittest.TestCase):
         """Query the API and compare scores against the expected snapshot."""
         key = f"{variant}|{hg}|{tool}"
         if key not in self.expected:
-            self.skipTest(f"No expected scores for {key}")
+            # Fail rather than skip. A key missing from the baseline means the two have drifted
+            # apart -- VARIANTS gained an entry, or the baseline was captured from a different
+            # list -- and skipping made that invisible: the baseline once covered only 44 of the
+            # 76 generated cases while the run still reported success.
+            self.fail(f"No expected scores for {key}. The baseline no longer covers VARIANTS; "
+                      f"re-capture it with 'python3 test_api_consistency.py --capture'.")
 
         expected = self.expected[key]
         if "error" in expected:
@@ -321,13 +386,48 @@ class TestAPIConsistency(unittest.TestCase):
         self.assertEqual(actual["g_name"], expected["g_name"], f"{key}: gene name mismatch")
         self.assertEqual(actual["t_priority"], expected["t_priority"], f"{key}: priority mismatch")
 
-        # Compare delta scores at 2 decimal places
+        # Compare delta scores at 2 decimal places, within SCORE_TOLERANCE
         score_keys = ("DS_SL", "DS_SG") if tool == "pangolin" else ("DS_AG", "DS_AL", "DS_DG", "DS_DL")
         for sk in score_keys:
-            self.assertEqual(
-                actual[sk], expected[sk],
-                f"{key}: {sk} mismatch: got {actual[sk]}, expected {expected[sk]}",
+            self.assertTrue(
+                scores_match(actual[sk], expected[sk]),
+                f"{key}: {sk} mismatch: got {actual[sk]}, expected {expected[sk]} "
+                f"(differs by {abs(actual[sk] - expected[sk]):.3f}, tolerance {SCORE_TOLERANCE})",
             )
+
+
+# (shortest spelling, spellings of the same variant padded with unchanged bases, hg). The padded
+# spellings used to get different SpliceAI scores (https://github.com/broadinstitute/SpliceAI-lookup/issues/137)
+# and were rejected by Pangolin. The last entry is a deletion-insertion: SpliceAI scored those all along,
+# with the older handling that zero-filled the rest of the span, while Pangolin rejected them outright.
+EQUIVALENT_SPELLINGS = [
+    ("1-55057514-G-A",    ("1-55057513-TG-TA", "1-55057511-GCTG-GCTA"), "38"),  # PCSK9 exon 7 donor SNV
+    ("1-55057513-TG-T",   ("1-55057512-CTG-CT",),                       "38"),  # the same donor base deleted
+    ("1-55057513-TG-GAA", ("1-55057512-CTG-CGAA",),                     "38"),  # the same bases replaced by three
+]
+
+
+class TestEquivalentSpellings(unittest.TestCase):
+    """Verify that a variant padded with unchanged bases scores exactly like its shortest spelling.
+
+    Needs no baseline: the shortest spelling's own response is what the padded ones are compared to.
+    """
+
+    def test_padded_spellings_score_like_the_shortest_spelling(self):
+        for shortest, padded_spellings, hg in EQUIVALENT_SPELLINGS:
+            for tool in ("spliceai", "pangolin"):
+                expected = query_api(tool, hg, shortest)
+                self.assertNotIn("error", expected, f"API error for {shortest}: {expected.get('error')}")
+                for padded in padded_spellings:
+                    with self.subTest(tool=tool, variant=padded):
+                        response = query_api(tool, hg, padded)
+                        self.assertNotIn("error", response, f"API error for {padded}: {response.get('error')}")
+                        self.assertEqual(response["variant"], padded, "the requested spelling is echoed")
+                        self.assertEqual(
+                            (response["pos"], response["ref"], response["alt"]),
+                            (expected["pos"], expected["ref"], expected["alt"]),
+                            "the shortest spelling is the one scored")
+                        self.assertEqual(response["scores"], expected["scores"])
 
 
 # Dynamically generate one test method per (variant, hg, tool) combination.

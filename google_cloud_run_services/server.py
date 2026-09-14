@@ -1,12 +1,14 @@
 import time
 _PROCESS_START_TIME = time.time()
 from datetime import datetime
+import gc
 import gzip
 import json
 import logging
 import os
 import psycopg2
 import re
+import sys
 import threading
 import traceback
 
@@ -16,12 +18,71 @@ from psycopg2.pool import ThreadedConnectionPool
 from contextlib import contextmanager
 
 # flask imports
-from flask import Flask, g, request, Response
+from flask import Flask, g, redirect, request, Response
 from flask_cors import CORS
 from flask_talisman import Talisman
 
 # SAI-10k-calc predictions for splice consequences
 from sai10k_predictions import sai10k_get_transcript_predictions, sai10k_select_transcript, TRANSCRIPT_PRIORITY_ORDER
+
+# Gunicorn worker classes that run more than one request at a time inside a single process, by
+# module name under gunicorn.workers (not by -k alias: -k gevent loads gunicorn.workers.ggevent).
+# gthread is what --threads N (N > 1) selects; the others are the async workers.
+_CONCURRENT_GUNICORN_WORKERS = ("gthread", "ggevent", "geventlet", "gtornado")
+
+
+def _assert_one_request_per_process():
+    """Refuse to start under a gunicorn worker that runs requests concurrently in one process.
+
+    Several objects here are built once per process and then read on every request without a
+    lock: the pyfastx handles in FASTA (check_ref_allele, SAI-10k premature-stop detection) and
+    the one inside each SPLICEAI_ANNOTATOR. pyfastx wraps a sqlite connection and is not safe to
+    use from two threads at once. Measured on a shared handle with 8 threads doing 400 reads
+    each: 58% of reads came back wrong and a third raised, and the wrong ones included plausible
+    but incorrect sequence rather than an error -- so a threaded worker would silently return
+    wrong reference alleles and wrong scores rather than failing visibly.
+
+    _FASTA_CHROM_PREFIX_CACHE in sai10k_predictions.py makes it worse: a racing fasta.keys() can
+    cache the wrong chromosome-prefix decision permanently for that handle.
+
+    So this is a hard failure at import rather than a warning. The Dockerfiles pass --threads 1
+    deliberately ("parallelism comes from running WORKERS workers, not threads within a worker");
+    this stops that from being undone silently by an edit, a config file, or GUNICORN_CMD_ARGS.
+
+    Detection reads sys.modules rather than sys.argv: gunicorn imports only the worker class it
+    is going to use, and that catches configurations argv does not carry, such as
+    GUNICORN_CMD_ARGS="--threads 5" or a gunicorn.conf.py. Nothing is raised when no gunicorn
+    worker module is loaded at all, which is the unit tests and the local Flask dev server; the
+    latter is kept to one request at a time by the threaded=False in app.run() at the bottom of
+    this file, since Flask's default is threaded=True.
+    """
+    loaded = [name for name in _CONCURRENT_GUNICORN_WORKERS
+              if f"gunicorn.workers.{name}" in sys.modules]
+    if not loaded:
+        return
+
+    # Only for the error message; the decision above does not depend on parsing this.
+    requested = ""
+    for source in (sys.argv, (os.environ.get("GUNICORN_CMD_ARGS") or "").split()):
+        for i, token in enumerate(source):
+            if token == "--threads" and i + 1 < len(source):
+                requested = f" (--threads {source[i + 1]})"
+            elif token.startswith("--threads="):
+                requested = f" (--threads {token.split('=', 1)[1]})"
+
+    raise RuntimeError(
+        f"Refusing to start: gunicorn is using the gunicorn.workers.{loaded[0]} worker{requested}, which runs "
+        f"more than one request at a time in a single process. The pyfastx reference-genome "
+        f"handles this server shares across requests are not safe to use concurrently and "
+        f"return silently wrong sequence, so a threaded worker would corrupt REF-allele checks "
+        f"and scores rather than fail visibly. Run with the default sync worker and --threads 1, "
+        f"and scale with --workers instead. If threads are genuinely needed, give each thread "
+        f"its own FASTA handle (threading.local) and fix the id()-keyed "
+        f"_FASTA_CHROM_PREFIX_CACHE in sai10k_predictions.py first."
+    )
+
+
+_assert_one_request_per_process()
 
 app = Flask(__name__)
 
@@ -32,9 +93,12 @@ app = Flask(__name__)
 CORS(app)
 
 
+# Set by the Dockerfiles, so it distinguishes a deployed container from a local checkout.
+RUNNING_ON_GOOGLE_CLOUD_RUN = bool(os.environ.get('RUNNING_ON_GOOGLE_CLOUD_RUN'))
+
 # On Cloud Run, disable Werkzeug's debug PIN / interactive traceback; keep it
 # on for local development.
-DEBUG = not os.environ.get('RUNNING_ON_GOOGLE_CLOUD_RUN')
+DEBUG = not RUNNING_ON_GOOGLE_CLOUD_RUN
 
 # Security headers: HSTS, CSP, X-Frame-Options, X-Content-Type-Options, etc.
 # force_https=False because Cloud Run's load balancer terminates TLS and
@@ -63,36 +127,299 @@ VARIANT_RE = re.compile(
     r"(?P<alt>[ACGT]+)"
 )
 
+# Matches a bare chrom+pos with no ref/alt (e.g. "chr8-140300615", "chr8:140300615"),
+# used for REF-only score requests where no ALT allele is available. fullmatch()
+# against this is tried only after VARIANT_RE's fullmatch fails, so a full
+# variant string is never misparsed as a position (the trailing "-C-G" etc.
+# keeps it from matching this pattern at all).
+POSITION_RE = re.compile(
+    r"(chr)?(?P<chrom>[0-9XYMTt]{1,2})"
+    r"[-\s:]+"
+    r"(?P<pos>[0-9]{1,9})"
+)
+
 FASTA_PATH = {
     "37": "/hg19.fa.gz",
     "38": "/hg38.fa.gz",
 }
 
-# Lazy pyfastx Fasta singletons keyed by genome_version, used by SAI-10k-calc's
-# premature-stop detection. Mirrors the SPLICEAI_ANNOTATOR cache pattern below.
-# pyfastx (already in the container's spliceai/requirements.txt) handles
-# bgzipped .fa.gz natively. Init failures are tolerated: detection silently
-# falls back to None on every aberration, leaving the rest of the SAI-10k
-# response intact.
-SAI10K_FASTA = {}
-_SAI10K_FASTA_LOCK = threading.Lock()
+# Lazy pyfastx Fasta singletons keyed by genome_version, shared by SAI-10k-calc's
+# premature-stop detection and by check_ref_allele below. Mirrors the
+# SPLICEAI_ANNOTATOR cache pattern below. pyfastx (in both the spliceai and the
+# pangolin requirements.txt) handles bgzipped .fa.gz natively. Init failures are
+# tolerated: both callers fall back to skipping their check rather than failing
+# the request, leaving the rest of the response intact.
+FASTA = {}
+_FASTA_LOCK = threading.Lock()
 
 
-def _get_sai10k_fasta(genome_version):
-    if genome_version in SAI10K_FASTA:
-        return SAI10K_FASTA[genome_version]
-    with _SAI10K_FASTA_LOCK:
-        if genome_version in SAI10K_FASTA:
-            return SAI10K_FASTA[genome_version]
+def _get_fasta(genome_version):
+    if genome_version in FASTA:
+        return FASTA[genome_version]
+    with _FASTA_LOCK:
+        if genome_version in FASTA:
+            return FASTA[genome_version]
         try:
             import pyfastx
-            SAI10K_FASTA[genome_version] = pyfastx.Fasta(FASTA_PATH[genome_version])
+            FASTA[genome_version] = pyfastx.Fasta(FASTA_PATH[genome_version])
         except Exception as e:
             print(f"WARNING: Failed to open FASTA for hg{genome_version} "
-                  f"(SAI-10k premature-stop detection disabled): "
+                  f"(REF-allele check and SAI-10k premature-stop detection disabled): "
                   f"{type(e).__name__}: {e}")
-            SAI10K_FASTA[genome_version] = None
-    return SAI10K_FASTA[genome_version]
+            FASTA[genome_version] = None
+    return FASTA[genome_version]
+
+
+def genome_display_name(genome_version):
+    """The name users know a genome build by, for error messages.
+
+    Args:
+        genome_version (str): "37" or "38"
+    """
+    return "hg19" if genome_version == "37" else "hg38"
+
+
+def resolve_fasta_sequence_name(fasta, chrom):
+    """Return the name this FASTA actually uses for `chrom`, or None if it carries no such sequence.
+
+    hg19's FASTA names its sequences "1".."22","X","Y","MT"; hg38's uses "chr1".."chrM". Accept
+    either spelling from the caller and look up whichever one this FASTA actually carries.
+
+    The mitochondrion is the one sequence whose bare name also differs between the builds: "MT"
+    in hg19, "M" (as "chrM") in hg38. get_spliceai_scores applies its own MITO_CHROM_NAME remap
+    for the model, but only after the checks that call this run, and get_pangolin_scores has no
+    remap at all -- MITO_CHROM_NAME is built by init_spliceai and does not exist in the Pangolin
+    container. So the alias is resolved here for both callers, where it is a fact about the
+    reference rather than about the tool, and both services validate the same variants.
+
+    Args:
+        fasta (pyfastx.Fasta): an open handle from _get_fasta
+        chrom (str): chromosome name, with or without a "chr" prefix
+    """
+    bare_chrom = chrom[3:] if chrom.lower().startswith("chr") else chrom
+    candidate_names = [chrom, bare_chrom, f"chr{bare_chrom}"]
+    if bare_chrom.upper() in ("M", "MT"):
+        alias = "MT" if bare_chrom.upper() == "M" else "M"
+        candidate_names += [alias, f"chr{alias}"]
+    return next((name for name in candidate_names if name in fasta), None)
+
+
+# Bases of sequence context both models read on each side of a variant, on top of the `distance`
+# the request asks for. Both slice that window straight out of pyfastx with no bounds check of
+# their own: spliceai's get_delta_scores and get_reference_scores do
+# ref_fasta[chrom][pos-wid//2-1 : pos+wid//2] where wid//2 == MODEL_FLANK_SIZE+distance, and
+# pangolin's process_variant and process_position do fasta[chrom][pos-5001-distance : ...].
+# Same start index either way, which is why one check covers both tools.
+MODEL_FLANK_SIZE = 5000
+
+
+def check_model_context_window(chrom, pos, ref_length, distance, genome_version):
+    """Check that the reference has enough sequence around `pos` for the models to read.
+
+    Returns an error message naming what is missing, or None when the window fits and scoring
+    should go ahead.
+
+    The start check exists because a window that runs off the *beginning* of a contig makes both
+    tools slice pyfastx with a negative start index, and pyfastx answers that by segfaulting --
+    killing the gunicorn worker and turning the request into a 503 rather than any kind of error
+    response. Every mitochondrial variant in a gene did this at the default distance (chrM's
+    genes start at 576, well inside the 5,500-base window), as did chr1's DDX11L1/WASH7P at
+    distance=10000. So unlike check_ref_allele this half deliberately does NOT fail open: it is
+    pure arithmetic on `pos` and `distance` and never consults the FASTA, because a FASTA that
+    failed to open must not turn the guard off and hand the crash back.
+
+    The end check is the mirror image and is only a message improvement: an over-long window is
+    answered by a short read rather than a signal, which SpliceAI already turns into "no scores"
+    (blaming GENCODE coverage, which sends users looking in the wrong place) and Pangolin into a
+    500. It needs the contig length, so it fails open like check_ref_allele when the FASTA or the
+    contig is unavailable.
+
+    Args:
+        chrom (str): chromosome name, with or without a "chr" prefix
+        pos (int): 1-based position of the variant
+        ref_length (int): length of the REF allele; 1 for a position-only query
+        distance (int): the request's "distance" parameter
+        genome_version (str): "37" or "38"
+    """
+    flank = MODEL_FLANK_SIZE + distance
+
+    if pos - flank - 1 < 0:
+        message = (f"{chrom}-{pos} is only {pos - 1:,}bp from the start of {chrom}, but SpliceAI and "
+                   f"Pangolin both read {flank:,}bp of sequence on each side of a variant "
+                   f"({MODEL_FLANK_SIZE:,}bp plus the distance setting of {distance:,}bp).")
+        # A smaller distance only helps once the position clears the fixed flank on its own.
+        if pos > MODEL_FLANK_SIZE:
+            return message + f" Retry with distance={pos - MODEL_FLANK_SIZE - 1} or less."
+        return message + (f" No distance setting is small enough, since {MODEL_FLANK_SIZE:,}bp of "
+                          f"context is required regardless of distance.")
+
+    fasta = _get_fasta(genome_version)
+    if fasta is None:
+        return None
+
+    sequence_name = resolve_fasta_sequence_name(fasta, chrom)
+    if sequence_name is None:
+        return None
+
+    # Pangolin's process_variant reads to pos+len(ref)+4999+distance, one base further than
+    # SpliceAI for every REF longer than a single base. Check the wider of the two.
+    contig_length = len(fasta[sequence_name])
+    bases_after = contig_length - pos
+    if pos + ref_length + flank - 1 > contig_length:
+        message = (f"{chrom}-{pos} is only {bases_after:,}bp from the end of {chrom}, but SpliceAI and "
+                   f"Pangolin both read {flank:,}bp of sequence on each side of a variant "
+                   f"({MODEL_FLANK_SIZE:,}bp plus the distance setting of {distance:,}bp).")
+        max_distance = bases_after - ref_length + 1 - MODEL_FLANK_SIZE
+        if max_distance >= 0:
+            return message + f" Retry with distance={max_distance} or less."
+        return message + (f" No distance setting is small enough, since {MODEL_FLANK_SIZE:,}bp of "
+                          f"context is required regardless of distance.")
+
+    return None
+
+
+def check_ref_allele_fits_window(ref, alt, distance):
+    """Check that the bases a variant replaces fit inside the window being scored.
+
+    The model reports one score per position from `distance` bases before the variant to `distance`
+    bases after it. Alleles of the same length are scored position by position, so any length fits,
+    but when the lengths differ the changed bases have to be collapsed onto the REF positions, and a
+    REF that reaches past the end of the window has nothing to collapse there. SpliceAI skips those
+    records, and without this check the empty result that comes back is reported as the variant
+    missing GENCODE's genes, which names the wrong cause.
+
+    This mirrors span_fits_in_output_window in the SpliceAI fork (spliceai/score_alignment.py), which
+    decides the same thing for the model. server.py can't import it: this same file also runs in the
+    Pangolin image, which has no spliceai package.
+
+    Args:
+        ref (str): REF allele
+        alt (str): ALT allele
+        distance (int): the request's "distance" parameter
+
+    Return:
+        str: an error message naming the real limit, or None when the REF fits
+    """
+    trimmed_pos, trimmed_ref, trimmed_alt = trim_shared_bases(0, ref, alt)
+    if len(trimmed_ref) == len(trimmed_alt):
+        return None
+
+    if trimmed_pos + len(trimmed_ref) <= distance + 1:
+        return None
+
+    retry_distance = len(ref) - 1
+    if retry_distance <= MAX_DISTANCE_LIMIT:
+        return (f"This variant's REF allele is {len(ref):,d} bases long, so it reaches past the "
+                f"{distance:,d} bases on either side of it that are being scored. "
+                f"Retry with distance={retry_distance} or more.")
+
+    return (f"This variant's REF allele is {len(ref):,d} bases long, so it reaches past the "
+            f"{MAX_DISTANCE_LIMIT:,d} bases on either side of a variant that can be scored.")
+
+
+def check_ref_allele_fits_pangolin_window(ref, distance):
+    """Check a variant's REF allele against the limit Pangolin sets on its own length.
+
+    Pangolin scores a window that extends `distance` bases past the end of the REF allele, so the bases
+    a variant changes always fall inside it, and unlike SpliceAI it needs no check that they fit. It does
+    refuse a REF longer than twice the distance ("Deletion too large" in process_variant), which reaches
+    the caller as an empty result and is reported as the model simply having no scores, naming no cause.
+
+    Args:
+        ref (str): REF allele
+        distance (int): the request's "distance" parameter
+
+    Return:
+        str: an error message naming the real limit, or None when the REF is short enough
+    """
+    if len(ref) <= 2 * distance:
+        return None
+
+    # Pangolin takes a REF of exactly twice the distance, so half its length, rounded up, is the
+    # smallest distance that works.
+    retry_distance = (len(ref) + 1) // 2
+    if retry_distance <= MAX_DISTANCE_LIMIT:
+        return (f"This variant's REF allele is {len(ref):,d} bases long, which is more than twice the "
+                f"{distance:,d} bases on either side of it that are being scored. "
+                f"Retry with distance={retry_distance} or more.")
+
+    return (f"This variant's REF allele is {len(ref):,d} bases long, which is more than twice the "
+            f"{MAX_DISTANCE_LIMIT:,d} bases on either side of a variant that can be scored.")
+
+
+def check_ref_allele(chrom, pos, ref, genome_version):
+    """Check the variant's REF allele against the reference genome.
+
+    Returns an error message naming the base the reference actually has, or None when the REF
+    matches and scoring should go ahead.
+
+    This runs before the model does, because the models answer a wrong REF with silence: SpliceAI
+    and Pangolin return no scores, and the message built for that case blames GENCODE coverage,
+    which sends users looking in the wrong place. The front end used to catch this by routing
+    every variant through Ensembl's VEP first, at the cost of an extra API call on the path where
+    it already had coordinates.
+
+    Deliberately fails open: a missing FASTA, an unknown contig, a position outside one, and a
+    reference that isn't plain ACGT (the chrY pseudoautosomal regions are hard-masked to N in both
+    builds) all return None. An infrastructure problem or a position the reference can't speak to
+    degrades to the previous behaviour, where the model decides, rather than rejecting a variant
+    that may well be fine.
+
+    Args:
+        chrom (str): chromosome name, with or without a "chr" prefix
+        pos (int): 1-based position of the variant
+        ref (str): the REF allele to check
+        genome_version (str): "37" or "38"
+    """
+    fasta = _get_fasta(genome_version)
+    if fasta is None:
+        return None
+
+    sequence_name = resolve_fasta_sequence_name(fasta, chrom)
+    if sequence_name is None:
+        return None
+
+    # Bound the interval before reading. pyfastx does not merely return short or raise for an
+    # out-of-range read: for many positions past a contig's end it segfaults, taking the whole
+    # gunicorn worker with it (verified on hg38 chr1 at 400,000,000 and above). VARIANT_RE accepts
+    # positions up to 999,999,999 and the endpoint is public and unauthenticated, so this has to be
+    # checked here rather than relied on to fail safely inside pyfastx. len() on the Sequence reads
+    # the length out of the index without loading any of it.
+    if pos < 1 or pos + len(ref) - 1 > len(fasta[sequence_name]):
+        return None
+
+    try:
+        # Sliced, not fetched. fasta.fetch() buffers the entire contig to answer even a one-base
+        # read -- 243 MB for chr1 -- which is per worker and permanent, and it pushed the spliceai
+        # containers into OOM kills. Slicing reads only the bases asked for. It is also the access
+        # pattern sai10k_predictions.py already uses on this same shared handle (_get_fasta), and
+        # the two APIs must not be mixed: after a fetch() call, slices on the same handle come back
+        # shifted (verified against pysam on hg38 chrM).
+        reference_allele = str(fasta[sequence_name][pos - 1 : pos + len(ref) - 1])
+    except Exception as e:
+        print(f"WARNING: Failed to read {sequence_name}:{pos} from the "
+              f"hg{genome_version} FASTA: {type(e).__name__}: {e}")
+        return None
+
+    # Belt and braces against an index that disagrees with the sequence: a partial read can't be
+    # compared, so treat it the same as not having the reference.
+    if len(reference_allele) != len(ref):
+        return None
+
+    reference_allele = reference_allele.upper()
+
+    # Both FASTAs hard-mask the chrY pseudoautosomal regions to N (hg38 chrY:10,001-2,781,479, hg19
+    # Y:10,001-2,649,520), and 200-odd GENCODE transcripts start inside them, SHOX among them. An N
+    # says nothing about the user's allele, so reporting "the reference allele is N" would be both
+    # wrong and blocking. Fail open like the other uncomparable cases and let the model decide.
+    if any(base not in "ACGT" for base in reference_allele):
+        return None
+    if reference_allele == ref.upper():
+        return None
+
+    return (f"{chrom}-{pos}-{ref} has an unexpected reference allele. The "
+            f"{genome_display_name(genome_version)} reference allele at {chrom}:{pos} is "
+            f"{reference_allele}, not {ref}.")
 
 GENCODE_VERSION = "v49"
 
@@ -110,8 +437,44 @@ GENOME_VERSION = os.environ.get("GENOME_VERSION")
 if GENOME_VERSION not in ("37", "38"):
     raise ValueError(f'Environment variable "GENOME_VERSION" should be set to either "37" or "38" instead of: "{os.environ.get("GENOME_VERSION")}"')
 
+# The single Gencode gene set this service answers for, pinned the same way GENOME_VERSION is.
+# Each container therefore loads exactly one annotator instead of accumulating one per gene set
+# its workers happened to be asked for, which is what pushed instances past their memory limit.
+# Defaults to "basic" so the long-standing service URLs keep their existing behaviour; the
+# comprehensive services set GENE_SET=comprehensive explicitly at deploy time.
+GENE_SET = os.environ.get("GENE_SET", "basic")
+if GENE_SET not in ("basic", "comprehensive"):
+    raise ValueError(f'Environment variable "GENE_SET" should be set to either "basic" or "comprehensive" instead of: "{GENE_SET}"')
+
+# "prod" or "dev". Mixed into the cache key (see get_splicing_scores_cache_key) so a dev
+# revision experimenting against the shared database can neither read nor overwrite the entries
+# production serves. Defaults to "prod" and contributes nothing to the key in that case, so this
+# component alone never invalidates a production entry. (The model and Gencode components added
+# alongside it do, once, on the deploy that introduces them.)
+DEPLOYMENT = os.environ.get("DEPLOYMENT", "prod")
+
+# The model package's pinned git commit, baked into the image by the Dockerfile from
+# ARG SPLICEAI_COMMIT / ARG PANGOLIN_COMMIT. Mixed into the cache key so that changing the pin
+# retires the entries the previous model computed on its own, instead of depending on somebody
+# also remembering to bump CACHE_VERSION by hand. Forgetting that bump does not fail loudly: the
+# service keeps serving scores the retired model produced, indefinitely and silently, which is
+# exactly the kind of wrong answer that is hardest to notice.
+#
+# Empty when the variable is absent, which omits the model component from the key. That is the
+# case for a checkout run outside the image and for any image built before this was added. Note
+# that such a key is still not the pre-change key: the Gencode component below is unconditional,
+# so adding these two components retires the existing entries once, for every caller.
+MODEL_COMMIT = os.environ.get("MODEL_COMMIT", "").strip()
+
 if TOOL == "spliceai":
-    from spliceai.utils import Annotator, get_delta_scores
+    from spliceai.utils import Annotator, get_delta_scores, get_reference_scores, MIN_SCORE_THRESHOLD
+
+    # The per-position score fields of an ALL_NON_ZERO_SCORES row from a delta-score response,
+    # and the threshold a row must clear to count as reportable. Both are tool-specific;
+    # MIN_SCORE_THRESHOLD is imported from the model package so it can't drift from the value the
+    # model itself filtered on. REF-only responses carry a different, smaller set of row fields,
+    # which is why count_scores_above_threshold is only called on the delta-score path.
+    PER_POSITION_SCORE_FIELDS = ("RA", "AA", "RD", "AD")
 
     class VariantRecord:
         def __init__(self, chrom, pos, ref, alt):
@@ -140,6 +503,11 @@ if TOOL == "spliceai":
 elif TOOL == "pangolin":
     from pkg_resources import resource_filename
     from pangolin.pangolin import process_variant as process_variant_using_pangolin
+    from pangolin.pangolin import process_position as process_position_using_pangolin
+    from pangolin.pangolin import MIN_SCORE_THRESHOLD
+
+    # see the comment on the spliceai branch above
+    PER_POSITION_SCORE_FIELDS = ("SL_REF", "SL_ALT", "SG_REF", "SG_ALT")
     from pangolin.model import torch, Pangolin, L, W, AR
     import gffutils
 
@@ -149,6 +517,20 @@ elif TOOL == "pangolin":
         ("37", "comprehensive"): f"/gencode.{GENCODE_VERSION}lift37.annotation.without_chr_prefix.db",
         ("38", "comprehensive"): f"/gencode.{GENCODE_VERSION}.annotation.db",
     }
+
+    # The 12 Pangolin models (4 splice-score types x 3 replicates each), populated by
+    # init_pangolin(). Their weights ship with the pangolin package and depend on neither the
+    # genome version nor the basic/comprehensive gene set, so one flat list serves every request.
+    #
+    # DANGER, and the reason init_pangolin() builds a local list and publishes it in a single
+    # assignment: pangolin.compute_score() slices this list positionally, `for model in
+    # models[3*j: 3*j+3]` with j in range(4). Python slicing returns a short (or empty) slice
+    # instead of raising, so a list observed while it is still being filled yields *silently
+    # wrong* scores. That is exactly the April-November 2024 bug, when the cache was a dict of
+    # lists appended to in place behind a `if not PANGOLIN_MODELS[key]` guard: a second
+    # concurrent request saw the guard satisfied after the first append and scored against a
+    # 1-of-12-model list. Never append to the published list; rebuild and reassign.
+    PANGOLIN_MODELS = None
 else:
     raise ValueError(f'Environment variable "TOOL" should be set to either "spliceai" or "pangolin" instead of: "{os.environ.get("TOOL")}"')
 
@@ -159,6 +541,60 @@ RATE_LIMIT_ERROR_MESSAGE = (
     f"numbers of variants programmatically will result in loss of access to this API for an extended period of time. Contact "
     f"us at https://github.com/broadinstitute/SpliceAI-lookup/issues if you have any questions."
 )
+
+
+def align_annotator_mito_chrom(annotator, mito_fasta_name):
+    """Rename the annotator's mitochondrial rows to the name its FASTA uses for that sequence.
+
+    Fixes hg19 mitochondrial variants, which scored as "no scores" whatever the user typed. The
+    three files disagree about what the mitochondrion is called, and only on hg19:
+
+        hg19: FASTA "MT",   SpliceAI annotation "chrM"
+        hg38: FASTA "chrM", SpliceAI annotation "chrM"
+
+    get_delta_scores uses one chromosome name for both lookups, passing it through
+    normalise_chrom(), which only adds or strips a "chr" prefix and so cannot translate M to MT.
+    On hg19 that makes the two lookups want different names and no single value satisfies both:
+    MITO_CHROM_NAME remaps the user's chromosome to "MT" for the FASTA, and normalise_chrom then
+    turns that into "chrMT" for the annotation, which stores "chrM" -- no transcript matches, and
+    the response blames GENCODE coverage. Feeding it "M" instead just moves the failure to the
+    FASTA read.
+
+    So rename the annotation's mito rows to the FASTA's spelling ("chrM" -> "chrMT" on hg19),
+    which makes "MT" resolve correctly on both sides. In memory only: the shipped annotation file
+    is untouched, and hg38, where the two already agree, is a no-op.
+
+    Args:
+        annotator (spliceai.utils.Annotator): a freshly built annotator, mutated in place
+        mito_fasta_name (str): the bare mito name from MITO_CHROM_NAME, or None if the FASTA
+            carries no mitochondrial sequence, in which case there is nothing to align
+    """
+    if not mito_fasta_name:
+        return
+
+    # astype(object) first: assigning the longer "chrMT" into a fixed-width numpy string array
+    # would silently truncate it back to "chrM" and quietly restore the bug.
+    chroms = annotator.chroms.astype(object)
+    if not len(chroms):
+        return
+
+    # Match get_name_and_strand, which normalises against the FIRST row, so the name written here
+    # has to carry the same prefix convention that row does.
+    prefix = "chr" if str(chroms[0]).startswith("chr") else ""
+    wanted = f"{prefix}{mito_fasta_name}"
+
+    renamed = 0
+    for i, chrom in enumerate(chroms):
+        chrom = str(chrom)
+        bare = chrom[3:] if chrom.lower().startswith("chr") else chrom
+        if bare.upper() in ("M", "MT") and chrom != wanted:
+            chroms[i] = wanted
+            renamed += 1
+
+    if renamed:
+        annotator.chroms = chroms
+        print(f"[startup pid={os.getpid()}] renamed {renamed} mitochondrial annotation rows to "
+              f"{wanted!r} to match the FASTA", flush=True)
 
 
 def init_spliceai(genome_version, basic_or_comprehensive):
@@ -179,6 +615,40 @@ def init_spliceai(genome_version, basic_or_comprehensive):
                 if candidate in keys:
                     MITO_CHROM_NAME[genome_version] = candidate[3:] if candidate.startswith('chr') else candidate
                     break
+        align_annotator_mito_chrom(SPLICEAI_ANNOTATOR[(genome_version, basic_or_comprehensive)],
+                                   MITO_CHROM_NAME.get(genome_version))
+
+
+def init_pangolin():
+    """Populate the module-level PANGOLIN_MODELS cache with all 12 Pangolin models.
+
+    Idempotent, and safe to call from concurrent requests: the models are built into a local
+    list and published in one assignment, so PANGOLIN_MODELS is only ever None or a complete
+    12-model list. Two callers racing here both build a full list and one overwrites the other
+    -- wasteful but correct. See the PANGOLIN_MODELS comment for why a partially published
+    list would silently corrupt scores.
+    """
+    global PANGOLIN_MODELS
+    if PANGOLIN_MODELS is not None:
+        return
+
+    t0 = time.time()
+    models = []
+    for i in 0, 2, 4, 6:
+        for j in 1, 2, 3:
+            model = Pangolin(L, W, AR)
+            if torch.cuda.is_available():
+                model.cuda()
+                weights = torch.load(resource_filename("pangolin", "models/final.%s.%s.3.v2" % (j, i)))
+            else:
+                weights = torch.load(resource_filename("pangolin", "models/final.%s.%s.3.v2" % (j, i)), map_location=torch.device('cpu'))
+            model.load_state_dict(weights)
+            model.eval()
+            models.append(model)
+
+    PANGOLIN_MODELS = models
+    print(f"[startup pid={os.getpid()}] init_pangolin() loaded {len(models)} models in {time.time() - t0:.2f}s "
+          f"(+{time.time() - _PROCESS_START_TIME:.2f}s since start)", flush=True)
 
 
 def init_transcript_annotations(genome_version, basic_or_comprehensive):
@@ -210,6 +680,74 @@ def parse_variant(variant_str):
         raise ValueError(f"Unable to parse variant: {variant_str}")
 
     return match['chrom'], int(match['pos']), match['ref'], match['alt']
+
+
+def parse_position(position_str):
+    match = POSITION_RE.fullmatch(position_str)
+    if not match:
+        raise ValueError(f"Unable to parse position: {position_str}")
+
+    return match['chrom'], int(match['pos'])
+
+
+def trim_shared_bases(pos, ref, alt):
+    """Trim the bases a variant's REF and ALT alleles share, giving its shortest spelling.
+
+    Bases shared at the end are dropped first, then bases shared at the start, and each allele always
+    keeps at least one base, so an insertion or deletion keeps its anchor base the way VCF writes it.
+    Dropping a leading base moves the position one base to the right; the variant is never shifted
+    through a repeat. For example 1-55057513-TG-TA trims to 1-55057514-G-A, and 1-55057512-CTG-CT to
+    1-55057513-TG-T. The SpliceAI fork trims the same way before it lines up ALT scores with REF
+    positions (bw2/SpliceAI spliceai/score_alignment.py), as does trimSharedBases in index.html.
+
+    Args:
+        pos (int): 1-based position of the variant
+        ref (str): REF allele
+        alt (str): ALT allele
+
+    Return:
+        tuple: (pos, ref, alt) of the shortest spelling
+    """
+    while len(ref) > 1 and len(alt) > 1 and ref[-1] == alt[-1]:
+        ref, alt = ref[:-1], alt[:-1]
+    while len(ref) > 1 and len(alt) > 1 and ref[0] == alt[0]:
+        pos, ref, alt = pos + 1, ref[1:], alt[1:]
+    return pos, ref, alt
+
+
+def get_spelling_to_score(chrom, pos, ref, alt, genome_version):
+    """Pick the spelling of a variant to score: its shortest one, unless its REF allele is wrong.
+
+    Scoring the shortest spelling gives every equivalent spelling of a variant the same scores. Otherwise
+    SpliceAI's scores for REF and ALT alleles that are both longer than one base depended on how many
+    unchanged bases were typed around the change
+    (https://github.com/broadinstitute/SpliceAI-lookup/issues/137), and Pangolin rejected such alleles
+    outright until its pinned fork learned to line their scores up.
+
+    The caller re-spells the variant for its cache key only when trimming changed something, and then
+    without a "chr" prefix, the way the page sends variants. So a spelling that needed no trimming, typed
+    as chr1-55057514-G-A, keeps a cache entry of its own, as spellings that differ only in notation always
+    have. The scores are the same either way.
+
+    Trimming drops the unchanged bases without reading them, and the REF check that get_spliceai_scores
+    and get_pangolin_scores run would then see only what was left, so a wrong unchanged base would go
+    unreported. The full REF is checked here first instead, and a variant whose REF doesn't match is
+    returned as given, for that later check to report in the usual way.
+
+    Args:
+        chrom (str): chromosome name, with or without a "chr" prefix
+        pos (int): 1-based position of the variant
+        ref (str): REF allele
+        alt (str): ALT allele
+        genome_version (str): "37" or "38"
+
+    Return:
+        tuple: (pos, ref, alt) to score
+    """
+    shortest_spelling = trim_shared_bases(pos, ref, alt)
+    if shortest_spelling != (pos, ref, alt) and check_ref_allele(chrom, pos, ref, genome_version):
+        return pos, ref, alt
+    return shortest_spelling
 
 
 def _env_flag(name, default=False):
@@ -263,17 +801,30 @@ BLOCKED_IPS = frozenset(ip.strip() for ip in os.environ.get("BLOCKED_IPS", "").s
 if not BLOCKED_IPS:
     print("WARNING: BLOCKED_IPS env var is unset/empty; no IPs will be blocked at the door", flush=True)
 
-# Module-level connection pool for Cloud SQL. Flask under Cloud Run typically
-# serves multiple concurrent requests per instance via threaded workers, so use
-# ThreadedConnectionPool (thread-safe) rather than SimpleConnectionPool.
-# Each gunicorn worker is a separate process (forked under --preload) with its
-# own pool and runs single-threaded (--threads 1), so it serves one request at a
-# time and needs only one DB connection. maxconn=2 keeps a one-slot safety margin
-# while bounding the total: workers x instances x services x maxconn must stay
-# under the server's max_connections (75). The previous maxconn=80 assumed Cloud
+# Module-level connection pool for Cloud SQL. ThreadedConnectionPool is used for its
+# getconn/putconn bookkeeping, not because anything here serves requests concurrently:
+# _assert_one_request_per_process refuses to start under a concurrent gunicorn worker and the
+# dev server is started with threaded=False, so one request per process is an invariant rather
+# than a typical case. Each gunicorn worker is a separate process (the Dockerfiles deliberately
+# omit --preload, so every worker imports this module itself after the fork) with its own pool,
+# and runs single-threaded (--threads 1), so it serves one request at a time and needs only one
+# DB connection. maxconn=2 keeps a one-slot safety margin. The previous maxconn=80 assumed Cloud
 # Run's default concurrency of 80, but the deploy pins --workers/--concurrency to
 # 6, so 80 per worker let a single instance open far more connections than the
 # tier allows -- exhausting max_connections and leaving dozens of idle backends.
+#
+# The bound this was sized against -- workers x instances x services x maxconn under the
+# server's max_connections (75) -- no longer holds, and nothing here enforces it. It was
+# written when there were 4 services (4 x 6 instances x 3 workers = 72, just under the limit);
+# the gene-set split doubled that to 8 (build_and_deploy.py deploys each tool/genome for both
+# "basic" and "comprehensive"), so full scale-out is now 4 x 6 x 3 + 4 x 6 x 2 = 120 workers,
+# each holding minconn=1, i.e. 120 connections before any pool reaches maxconn=2, against a
+# limit of 75. Dropping maxconn to 1 would not fix it: minconn=1 already puts the floor at 120.
+# Closing the gap needs fewer instances/workers or a larger max_connections, which is a
+# deployment decision rather than a code one. Until then, a fleet-wide burst can exhaust
+# max_connections, after which get_db_connection yields None and every DB-backed behavior
+# degrades silently: cache lookups miss so requests re-run the model, exceeds_rate_limit
+# returns False, and transcript-structure enrichment is skipped.
 # If initialisation fails (e.g. transient Cloud SQL hiccup at startup, or
 # DB_PASSWORD not set in a local dev environment), DATABASE_CONNECTION_POOL
 # stays None and get_db_connection falls back to opening a connection per
@@ -293,8 +844,14 @@ _database_pool_init_lock = threading.Lock()
 # build_and_deploy.py's update_transcript_tables command), and SAI-10k degrades
 # gracefully to the bundled annotations when they are absent.
 _SCHEMA_DDL_STATEMENTS = (
+    # No separate index on cache(key): the UNIQUE constraint above already builds one
+    # (cache_key_key), and the only query against this table is an equality lookup on key, which
+    # uses it. A second btree on the same column was here until 2026-08-14, costing 70 MB and a
+    # duplicate index write on every cached response. Dropping it by hand was not enough -- this
+    # statement recreated it on the next container start.
     "CREATE TABLE IF NOT EXISTS cache (key TEXT UNIQUE, value TEXT, counter INT, accessed TIMESTAMP DEFAULT now())",
-    "CREATE INDEX IF NOT EXISTS cache_index ON cache (key)",
+    # variant_consequence has not been written since 2026-09-01 (log() no longer takes it); it stays
+    # in the DDL so the rows written before then, and connect_to_db.sh's queries over them, keep working.
     "CREATE TABLE IF NOT EXISTS log (event_name TEXT, ip TEXT, logtime TIMESTAMP DEFAULT now(), duration REAL, variant TEXT, genome VARCHAR(10), bc VARCHAR(20), distance INT, mask INT4, details TEXT, variant_consequence TEXT)",
     "CREATE INDEX IF NOT EXISTS idx_log_ip_logtime ON log USING btree (ip, logtime DESC)",
     "CREATE INDEX IF NOT EXISTS idx_log_event_name ON log USING btree (event_name)",
@@ -359,11 +916,12 @@ def _try_init_database_pool():
             print(f"WARNING: DB connection pool init failed; falling back to per-request connections: {e}", flush=True)
 
 
-# The pool is initialised lazily on the first request (see get_db_connection),
-# not at import time. Under gunicorn --preload the module is imported once in the
-# arbiter before workers fork; initialising the pool here would share a single
-# connection's socket across all forked workers and corrupt the protocol. Lazy
-# init means each worker opens its own pool after the fork.
+# The pool is initialised lazily on the first request (see get_db_connection), not at import
+# time. Since the Dockerfiles dropped --preload, this module is already imported per worker
+# after the fork, so a pool built at import would no longer be shared across workers the way it
+# would have been under --preload -- but lazy init is kept regardless: it lets a worker that
+# started while Cloud SQL was briefly unreachable retry (throttled) instead of being stuck
+# without a pool for the container's whole life.
 
 
 @contextmanager
@@ -494,7 +1052,7 @@ def run_sql(conn, sql_query, *params):
     return results
 
 
-def get_transcript_structures(conn, transcript_ids, genome_version):
+def get_transcript_structures(conn, transcript_ids, genome_version, empty_when_table_missing=False):
     """Batch-fetch transcript structure for many transcripts in one round trip.
 
     Args:
@@ -502,6 +1060,12 @@ def get_transcript_structures(conn, transcript_ids, genome_version):
         transcript_ids: iterable of transcript IDs WITHOUT version suffix
             (e.g. "ENST00000123456"). Caller is responsible for stripping ".N".
         genome_version: "37" or "38".
+        empty_when_table_missing (bool): when True, a query that fails because the
+            transcripts_hgNN table does not exist returns {} rather than None. That
+            table is not created automatically (it needs build_and_deploy.py's
+            update_transcript_tables), so its absence is a permanent property of the
+            database rather than something a retry fixes, and a caller that skips its
+            cache write on None would otherwise recompute every response forever.
 
     Returns:
         dict mapping transcript_id -> structure dict (same fields the prior
@@ -530,6 +1094,16 @@ def get_transcript_structures(conn, transcript_ids, genome_version):
                FROM {table_name} WHERE transcript_id = ANY(%s)""",
             (transcript_ids,)
         )
+    except psycopg2.ProgrammingError as e:
+        # UndefinedTable (the table was never loaded) is a ProgrammingError, as is a malformed
+        # query. Neither changes on a retry, so a caller that asked to be told apart gets {}:
+        # "this database has no structures to give", not "ask again later".
+        if empty_when_table_missing:
+            print(f"WARNING: cannot read transcripts_hg{genome_version}, so no exon annotations "
+                  f"are available from this database: {e}", flush=True)
+            return {}
+        print(f"DB error fetching transcript structures for hg{genome_version}: {e}", flush=True)
+        return None
     except psycopg2.Error as e:
         # A transient OperationalError (e.g. broken connection mid-query)
         # returns None so SAI-10k falls back to annotation-based defaults
@@ -725,18 +1299,86 @@ def exceeds_rate_limit(conn, user_ip, params):
 
 # Bump SAI10K_VERSION whenever sai10k_predictions.py changes its classification
 # logic or output shape, so cached responses from older algorithm versions are
-# invalidated and recomputed.
-SAI10K_VERSION = "v21"
+# invalidated and recomputed. v22 discards the v21 entries, whose protein windows are
+# null for variants whose footprint straddles a shifted splice boundary (issue #134) --
+# those entries predate the substitution-clipping fix and would otherwise keep serving
+# a response with no protein sequence for exactly the variants the fix targets.
+SAI10K_VERSION = "v22"
+
+# Bump CACHE_VERSION whenever the SHAPE of the cached response changes for either tool, and also
+# whenever the scores change for a reason that is not one of the two inputs already in the key.
+# Those two are the model package's pinned commit (MODEL_COMMIT) and the Gencode version
+# (GENCODE_VERSION); re-pinning or re-versioning either retires the old entries on its own. What
+# is NOT covered is score logic living in this file -- a change to how a response is derived from
+# the model's raw output still needs a bump here.
+# v2 added the per-position rows (ALL_NON_ZERO_SCORES) and nNonZeroScores to the cached copy
+# so the /scores endpoints can serve any transcript without re-running the model. v3 discards
+# the v2 entries, which were written by a revision whose model packages predated the per-position
+# ref/alt bases, and so hold rows the current code cannot render.
+CACHE_VERSION = "v3"
 
 
-def get_splicing_scores_cache_key(tool_name, variant, genome_version, distance, mask, basic_or_comprehensive="basic"):
-    suffix = f"__sai10k-{SAI10K_VERSION}" if tool_name == "spliceai" else ""
-    return f"{tool_name}__{variant}__hg{genome_version}__d{distance}__m{mask}__{basic_or_comprehensive}{suffix}"
+def is_score_above_threshold(row):
+    """Whether one ALL_NON_ZERO_SCORES row cleared the model's reporting threshold.
+
+    The model packages also report the variant's own position and the delta-score maxima, whose
+    scores can be below their threshold. Judging each row by its own scores keeps that
+    distinction here, where the consumers live, instead of asking the model packages to mark
+    rows on their behalf.
+
+    The scores are strings the model already rounded to 3 decimals, so a true score just under
+    the threshold (0.0095 renders as "0.010") still passes. That residual is the safe direction
+    for the count below, and for the visualization it is a rare single-position overshoot.
+
+    Args:
+        row (dict): one ALL_NON_ZERO_SCORES entry from a delta-score response. REF-only
+            responses carry a different, smaller set of row fields and are not handled here.
+
+    Returns:
+        bool
+    """
+    return max(float(row[score_field]) for score_field in PER_POSITION_SCORE_FIELDS) >= MIN_SCORE_THRESHOLD
 
 
-def get_splicing_scores_from_cache(conn, tool_name, variant, genome_version, distance, mask, basic_or_comprehensive="basic"):
+def count_scores_above_threshold(transcript_scores):
+    """Count the per-position rows that cleared the model's reporting threshold.
+
+    Zero is what tells the UI to disable that transcript's table icon, so the positions the
+    model adds below its threshold must not be counted here.
+
+    Args:
+        transcript_scores (dict): one transcript's entry, carrying ALL_NON_ZERO_SCORES.
+
+    Returns:
+        int
+    """
+    return sum(1 for row in (transcript_scores.get("ALL_NON_ZERO_SCORES") or []) if is_score_above_threshold(row))
+
+
+def get_splicing_scores_cache_key(tool_name, variant, genome_version, distance, mask, basic_or_comprehensive="basic", is_position_only=False):
+    # REF-only (position-only) spliceai responses never run SAI-10k-calc (it requires
+    # an ALT allele), so bumping SAI10K_VERSION should not invalidate their cache entries.
+    suffix = f"__sai10k-{SAI10K_VERSION}" if tool_name == "spliceai" and not is_position_only else ""
+    # The two inputs that decide what the scores are, beyond this request's own parameters: the
+    # model package, and the Gencode annotation the model scores against. Changing either changes
+    # the answer, so entries computed under the old one have to stop being served, and including
+    # both here is what makes that automatic rather than a step somebody has to remember.
+    # MODEL_COMMIT is truncated because the first 8 hex characters already distinguish any two
+    # commits this repository will ever pin, and the key is a database column.
+    if MODEL_COMMIT:
+        suffix += f"__model-{MODEL_COMMIT[:8]}"
+    suffix += f"__gencode-{GENCODE_VERSION}"
+    # Dev revisions share production's database, so without this a dev revision computing a
+    # result would write it onto the key production reads -- publishing unreviewed output to
+    # every user. Production adds nothing here, so this component never invalidates an entry.
+    if DEPLOYMENT != "prod":
+        suffix += f"__{DEPLOYMENT}"
+    return f"{tool_name}__{variant}__hg{genome_version}__d{distance}__m{mask}__{basic_or_comprehensive}__{CACHE_VERSION}{suffix}"
+
+
+def get_splicing_scores_from_cache(conn, tool_name, variant, genome_version, distance, mask, basic_or_comprehensive="basic", is_position_only=False):
     results = {}
-    key = get_splicing_scores_cache_key(tool_name, variant, genome_version, distance, mask, basic_or_comprehensive)
+    key = get_splicing_scores_cache_key(tool_name, variant, genome_version, distance, mask, basic_or_comprehensive, is_position_only)
     try:
         rows = run_sql(conn, f"SELECT value FROM cache WHERE key=%s", (key,))
         if rows:
@@ -748,8 +1390,8 @@ def get_splicing_scores_from_cache(conn, tool_name, variant, genome_version, dis
     return results
 
 
-def add_splicing_scores_to_cache(conn, tool_name, variant, genome_version, distance, mask, basic_or_comprehensive, results):
-    key = get_splicing_scores_cache_key(tool_name, variant, genome_version, distance, mask, basic_or_comprehensive)
+def add_splicing_scores_to_cache(conn, tool_name, variant, genome_version, distance, mask, basic_or_comprehensive, results, is_position_only=False):
+    key = get_splicing_scores_cache_key(tool_name, variant, genome_version, distance, mask, basic_or_comprehensive, is_position_only)
     try:
         results_string = json.dumps(results)
 
@@ -769,6 +1411,46 @@ def get_spliceai_scores(variant, genome_version, distance_param, mask_param, bas
             "variant": variant,
             "source": "spliceai",
             "error": str(e),
+        }
+
+    # Checked before the mito remap below, on the chromosome name the user actually submitted.
+    # get_pangolin_scores has no such remap, and the message embeds the name it was given, so
+    # remapping first would make the two services word the same error differently ("MT-100-A" vs
+    # "M-100-A") and defeat the front end's duplicate suppression. check_ref_allele resolves the
+    # M/MT alias itself, so it does not need the remapped name.
+    ref_allele_error = check_ref_allele(chrom, pos, ref, genome_version)
+    if ref_allele_error:
+        return {
+            "variant": variant,
+            "source": "spliceai",
+            "error": ref_allele_error,
+            # This one is about the variant, not about this tool. Both tools return it for the same
+            # input, so the front end shows it plainly and only once, rather than twice wrapped in
+            # each tool's "<tool> API call error" prefix.
+            "inputError": True,
+        }
+
+    # Must run before get_delta_scores too: it skips a variant whose REF reaches past the scored window,
+    # and the empty result that comes back would otherwise be reported as a missing gene annotation.
+    # Deliberately not an inputError: Pangolin has no such limit and answers these variants, and the page
+    # shows an inputError on its own in place of both tools' tables.
+    ref_window_error = check_ref_allele_fits_window(ref, alt, distance_param)
+    if ref_window_error:
+        return {
+            "variant": variant,
+            "source": "spliceai",
+            "error": ref_window_error,
+        }
+
+    # Must run before get_delta_scores: a window that underruns the contig segfaults the worker.
+    context_window_error = check_model_context_window(chrom, pos, len(ref), distance_param, genome_version)
+    if context_window_error:
+        return {
+            "variant": variant,
+            "source": "spliceai",
+            "error": context_window_error,
+            # Same for both tools on the same input -- see the comment above.
+            "inputError": True,
         }
 
     # spliceai's normalise_chrom() handles "chr" prefix mismatches but not the
@@ -863,7 +1545,13 @@ def get_spliceai_scores(variant, genome_version, distance_param, mask_param, bas
     # to return to the client and (b) which transcript to feed into SAI-10k-calc.
     sai10k_t0 = time.perf_counter()
     selected_transcript = sai10k_select_transcript(candidate_transcripts)
-    all_non_zero_scores = selected_transcript["ALL_NON_ZERO_SCORES"] if selected_transcript else None
+    # The visualization tracks re-filter these rows with their own cutoffs, which are looser
+    # than the model's, so hand them only the rows that cleared the model threshold. Otherwise
+    # the positions the model adds below threshold would be drawn as marks that were never
+    # drawn before. The /scores endpoints serve the full set from the cached copy.
+    all_non_zero_scores = [
+        row for row in selected_transcript["ALL_NON_ZERO_SCORES"] if is_score_above_threshold(row)
+    ] if selected_transcript else None
     # Prefer STRAND (from the SpliceAI annotator, structurally guaranteed) and
     # fall back to t_strand from the external transcript-annotations JSON. This
     # matches sai10k_predictions.py:1150 so the strand reported in the JSON
@@ -878,7 +1566,7 @@ def get_spliceai_scores(variant, genome_version, distance_param, mask_param, bas
     fasta_open_ms = 0.0
     if selected_transcript:
         fasta_t0 = time.perf_counter()
-        sai10k_fasta = _get_sai10k_fasta(genome_version)
+        sai10k_fasta = _get_fasta(genome_version)
         fasta_open_ms = (time.perf_counter() - fasta_t0) * 1000
         # Premature-stop detection requires the FASTA. When it failed to open,
         # the resulting predictions have null stop_codon_introduced / aa_change
@@ -931,8 +1619,14 @@ def get_spliceai_scores(variant, genome_version, distance_param, mask_param, bas
         flush=True,
     )
 
+    # ALL_NON_ZERO_SCORES stays in the dict so it reaches the cache, which lets the
+    # /spliceai/scores endpoint serve any transcript's per-position rows without re-running
+    # the model. run_splice_prediction_tool drops it from the HTTP response and keeps only
+    # nNonZeroScores, which is all the results table needs in order to decide whether the
+    # per-position table is worth offering for a given transcript.
     for transcript_scores in candidate_transcripts:
-        for redundant_key in ("ALLELE", "NAME", "STRAND", "ALL_NON_ZERO_SCORES"):
+        transcript_scores["nNonZeroScores"] = count_scores_above_threshold(transcript_scores)
+        for redundant_key in ("ALLELE", "NAME", "STRAND"):
             transcript_scores.pop(redundant_key, None)
 
     return {
@@ -963,6 +1657,98 @@ def get_spliceai_scores(variant, genome_version, distance_param, mask_param, bas
     }
 
 
+def get_spliceai_reference_scores(variant, genome_version, distance_param, basic_or_comprehensive_param):
+    """REF-only counterpart of get_spliceai_scores: variant is a bare chrom-pos
+    position (no ref/alt). No SAI-10k-calc predictions or DB transcript-
+    structure enrichment -- those require an ALT allele.
+    """
+    chrom, pos = parse_position(variant)
+
+    # Checked before the mito remap below, on the chromosome name the user submitted, so both
+    # tools word this the same way -- see the matching comment in get_spliceai_scores.
+    context_window_error = check_model_context_window(chrom, pos, 1, distance_param, genome_version)
+    if context_window_error:
+        return {
+            "variant": variant,
+            "source": "spliceai",
+            "error": context_window_error,
+            "inputError": True,
+        }
+
+    # spliceai's normalise_chrom() handles "chr" prefix mismatches but not the
+    # M↔MT alias -- see the matching comment in get_spliceai_scores.
+    if chrom.upper() in {"M", "MT"} and genome_version in MITO_CHROM_NAME:
+        chrom = MITO_CHROM_NAME[genome_version]
+
+    try:
+        scores = get_reference_scores(
+            chrom, pos,
+            SPLICEAI_ANNOTATOR[(genome_version, basic_or_comprehensive_param)],
+            distance_param)
+    except Exception as e:
+        print(f"ERROR while computing SpliceAI REF scores for {variant}: {e}")
+        traceback.print_exc()
+        return {
+            "variant": variant,
+            "source": "spliceai",
+            "error": f"{type(e)}: {e}",
+        }
+
+    if not scores:
+        return {
+            "variant": variant,
+            "source": "spliceai",
+            "error": f"The SpliceAI model did not return any scores for {variant}. This may be because the position does "
+                     f"not overlap any exons or introns defined by the GENCODE '{basic_or_comprehensive_param}' annotation.",
+        }
+
+    # Enrich each transcript_scores with in-memory annotations (no DB), same as get_spliceai_scores.
+    candidate_transcripts = []
+    for transcript_scores in scores:
+        transcript_id_without_version = transcript_scores.get("NAME", "").split(".")[0]
+        transcript_annotations = SHARED_TRANSCRIPT_ANNOTATIONS[(genome_version, basic_or_comprehensive_param)].get(transcript_id_without_version)
+        if transcript_annotations is None:
+            raise ValueError(f"Missing annotations for {transcript_id_without_version} in {genome_version} annotations")
+        transcript_scores.update(transcript_annotations)
+        candidate_transcripts.append(transcript_scores)
+
+    # Select the transcript to visualize: highest priority (MS > MP > C > N),
+    # then highest combined |RA_MAX| + |RD_MAX|. Mirrors the selection logic in
+    # get_pangolin_scores below.
+    selected_transcript = None
+    best_priority = -1
+    best_score_sum = -1.0
+    for transcript_scores in candidate_transcripts:
+        priority = TRANSCRIPT_PRIORITY_ORDER.get(transcript_scores.get('t_priority', 'N'), 0)
+        score_sum = abs(float(transcript_scores['RA_MAX'])) + abs(float(transcript_scores['RD_MAX']))
+        if priority > best_priority or (priority == best_priority and score_sum > best_score_sum):
+            selected_transcript = transcript_scores
+            best_priority = priority
+            best_score_sum = score_sum
+
+    all_non_zero_scores = selected_transcript["ALL_NON_ZERO_SCORES"] if selected_transcript else None
+    all_non_zero_scores_strand = (selected_transcript.get("STRAND") or selected_transcript.get("t_strand")) if selected_transcript else None
+    all_non_zero_scores_transcript_id = selected_transcript["t_id"] if selected_transcript else None
+
+    for transcript_scores in candidate_transcripts:
+        for redundant_key in ("NAME", "STRAND", "ALL_NON_ZERO_SCORES"):
+            transcript_scores.pop(redundant_key, None)
+
+    return {
+        "variant": variant,
+        "genomeVersion": genome_version,
+        "chrom": chrom,
+        "pos": pos,
+        "distance": distance_param,
+        "scores": scores,
+        "source": "spliceai:model",
+        "isPositionOnly": True,
+        "allNonZeroScores": all_non_zero_scores,
+        "allNonZeroScoresStrand": all_non_zero_scores_strand,
+        "allNonZeroScoresTranscriptId": all_non_zero_scores_transcript_id,
+    }
+
+
 def get_pangolin_scores(variant, genome_version, distance_param, mask_param, basic_or_comprehensive_param):
     if genome_version not in ("37", "38"):
         raise ValueError(f"Invalid genome_version: {genome_version}")
@@ -985,11 +1771,42 @@ def get_pangolin_scores(variant, genome_version, distance_param, mask_param, bas
             "error": str(e),
         }
 
-    if len(ref) > 1 and len(alt) > 1:
+    # See the matching comment in get_spliceai_scores: a wrong REF scores as silence otherwise.
+    ref_allele_error = check_ref_allele(chrom, pos, ref, genome_version)
+    if ref_allele_error:
         return {
             "variant": variant,
             "source": "pangolin",
-            "error": f"Pangolin does not currently support complex InDels like {chrom}-{pos}-{ref}-{alt}",
+            "error": ref_allele_error,
+            # see the matching comment in get_spliceai_scores
+            "inputError": True,
+        }
+
+    # Checked after the REF so that a wrong REF is reported as one. That includes a variant padded with
+    # unchanged bases, which get_spelling_to_score leaves untrimmed when its REF doesn't match.
+    #
+    # Alleles that are both longer than one base were rejected here as "complex InDels" until the
+    # pinned Pangolin fork learned to line their scores up (pangolin/score_alignment.py). What is left
+    # is Pangolin's own limit on how long a REF allele it will score.
+    ref_window_error = check_ref_allele_fits_pangolin_window(ref, distance_param)
+    if ref_window_error:
+        return {
+            "variant": variant,
+            "source": "pangolin",
+            "error": ref_window_error,
+        }
+
+    # See the matching comment in get_spliceai_scores. Pangolin reads the FASTA before it checks
+    # for an overlapping gene, so unlike SpliceAI it segfaults on any variant this close to a
+    # contig start, whether or not the position falls in a gene.
+    context_window_error = check_model_context_window(chrom, pos, len(ref), distance_param, genome_version)
+    if context_window_error:
+        return {
+            "variant": variant,
+            "source": "pangolin",
+            "error": context_window_error,
+            # see the matching comment in get_spliceai_scores
+            "inputError": True,
         }
 
     class PangolinArgs:
@@ -999,23 +1816,15 @@ def get_pangolin_scores(variant, genome_version, distance_param, mask_param, bas
         score_cutoff = None
         score_exons = "False"
 
-    pangolin_models = []
+    init_pangolin()
 
-    for i in 0, 2, 4, 6:
-        for j in 1, 2, 3:
-            model = Pangolin(L, W, AR)
-            if torch.cuda.is_available():
-                model.cuda()
-                weights = torch.load(resource_filename("pangolin", "models/final.%s.%s.3.v2" % (j, i)))
-            else:
-                weights = torch.load(resource_filename("pangolin", "models/final.%s.%s.3.v2" % (j, i)), map_location=torch.device('cpu'))
-            model.load_state_dict(weights)
-            model.eval()
-            pangolin_models.append(model)
-
+    # FeatureDB stays per-request: it wraps a sqlite3 connection, which is bound to the thread
+    # that opened it, and opening one is a few milliseconds against an on-disk index (unlike the
+    # models, it does not read the database into memory). Caching it would trade nothing for a
+    # cross-thread sharing hazard.
     features_db = gffutils.FeatureDB(PANGOLIN_ANNOTATION_PATHS[(genome_version, basic_or_comprehensive_param)])
     scores = process_variant_using_pangolin(
-        0, chrom, int(pos), ref, alt, features_db, pangolin_models, PangolinArgs)
+        0, chrom, int(pos), ref, alt, features_db, PANGOLIN_MODELS, PangolinArgs)
 
     if not scores:
         return {
@@ -1040,6 +1849,44 @@ def get_pangolin_scores(variant, genome_version, distance_param, mask_param, bas
         transcript_scores.update(transcript_annotations)
         candidate_transcripts.append(transcript_scores)
 
+    # Brief DB scope: add EXON_STARTS/EXON_ENDS so the per-position table can label annotated
+    # acceptors and donors for Pangolin the same way it does for SpliceAI. A lookup that failed
+    # for a reason a retry could fix leaves the response degraded (here: a blank Notes column),
+    # so don't cache it -- otherwise it would be re-served long after the DB recovered. A
+    # permanently missing table is the opposite case and is cached; see below.
+    skip_cache = False
+    if candidate_transcripts:
+        candidate_ids = [transcript_scores.get("NAME", "").split(".")[0] for transcript_scores in candidate_transcripts]
+        with get_db_connection() as conn:
+            # empty_when_table_missing so a database that simply never loaded
+            # transcripts_hgNN yields {} and takes the cache-anyway path below, rather than
+            # looking like an outage and making every Pangolin response uncacheable forever.
+            structures = get_transcript_structures(
+                conn, candidate_ids, genome_version, empty_when_table_missing=True) if conn is not None else None
+
+        if structures is None:
+            # The DB was unreachable or the query failed in a way a retry could fix. Don't
+            # cache a response whose Notes column would stay blank long after it recovered.
+            print(f"WARNING: transcript-structure lookup unavailable for {variant}; the Pangolin "
+                  f"per-position table will have no exon annotations and the result will not be cached.", flush=True)
+            skip_cache = True
+        else:
+            for transcript_scores, transcript_id_without_version in zip(candidate_transcripts, candidate_ids):
+                transcript_structure = structures.get(transcript_id_without_version)
+                if transcript_structure:
+                    # Copy only the exon coordinates. get_transcript_structures also returns
+                    # CDS_START/CDS_END/STRAND, and merging those wholesale would replace
+                    # Pangolin's own STRAND, which is read below into allNonZeroScoresStrand.
+                    for exon_key in ("EXON_STARTS", "EXON_ENDS"):
+                        transcript_scores[exon_key] = transcript_structure[exon_key]
+                else:
+                    # The query worked, this transcript simply has no row. That won't change on a
+                    # retry, so cache the response anyway rather than recomputing it forever --
+                    # only the Notes column is affected, and CACHE_VERSION can flush it later.
+                    print(f"WARNING: transcript {transcript_id_without_version} not found in "
+                          f"transcripts_hg{genome_version} for {variant}; the Pangolin per-position "
+                          f"table will have no exon annotations for it.", flush=True)
+
     # Select transcript: highest priority, then highest sum of |DS_SL| + |DS_SG|
     selected_transcript = None
     best_priority = -1
@@ -1052,12 +1899,21 @@ def get_pangolin_scores(variant, genome_version, distance_param, mask_param, bas
             best_priority = priority
             best_score_sum = score_sum
 
-    all_non_zero_scores = selected_transcript["ALL_NON_ZERO_SCORES"] if selected_transcript else None
+    # The visualization tracks re-filter these rows with their own cutoffs, which are looser
+    # than the model's, so hand them only the rows that cleared the model threshold. Otherwise
+    # the positions the model adds below threshold would be drawn as marks that were never
+    # drawn before. The /scores endpoints serve the full set from the cached copy.
+    all_non_zero_scores = [
+        row for row in selected_transcript["ALL_NON_ZERO_SCORES"] if is_score_above_threshold(row)
+    ] if selected_transcript else None
     all_non_zero_scores_strand = selected_transcript["STRAND"] if selected_transcript else None
     all_non_zero_scores_transcript_id = selected_transcript["NAME"] if selected_transcript else None
 
+    # see the matching comment in get_spliceai_scores: the per-position rows stay in the dict
+    # so they reach the cache for /pangolin/scores, and are stripped from the HTTP response
     for transcript_scores in candidate_transcripts:
-        for redundant_key in ("NAME", "STRAND", "ALL_NON_ZERO_SCORES"):
+        transcript_scores["nNonZeroScores"] = count_scores_above_threshold(transcript_scores)
+        for redundant_key in ("NAME", "STRAND"):
             transcript_scores.pop(redundant_key, None)
 
     return {
@@ -1074,6 +1930,95 @@ def get_pangolin_scores(variant, genome_version, distance_param, mask_param, bas
         "allNonZeroScores": all_non_zero_scores,
         "allNonZeroScoresStrand": all_non_zero_scores_strand,
         "allNonZeroScoresTranscriptId": all_non_zero_scores_transcript_id,
+        # Internal sentinel, stripped by run_splice_prediction_tool before the response is
+        # returned. True when the transcript-structure lookup failed, so the exon annotations
+        # are missing and the response should not be cached past the underlying recovery.
+        "_skip_cache": skip_cache,
+    }
+
+
+def get_pangolin_reference_scores(variant, genome_version, distance_param, basic_or_comprehensive_param):
+    """REF-only counterpart of get_pangolin_scores: variant is a bare chrom-pos
+    position (no ref/alt).
+    """
+    if genome_version not in ("37", "38"):
+        raise ValueError(f"Invalid genome_version: {genome_version}")
+
+    if basic_or_comprehensive_param not in ("basic", "comprehensive"):
+        raise ValueError(f"Invalid basic_or_comprehensive_param: {basic_or_comprehensive_param}")
+
+    chrom, pos = parse_position(variant)
+
+    # see the matching comment in get_pangolin_scores
+    context_window_error = check_model_context_window(chrom, pos, 1, distance_param, genome_version)
+    if context_window_error:
+        return {
+            "variant": variant,
+            "source": "pangolin",
+            "error": context_window_error,
+            "inputError": True,
+        }
+
+    class PangolinArgs:
+        reference_file = FASTA_PATH[genome_version]
+        distance = distance_param
+
+    init_pangolin()
+
+    # Per-request FeatureDB: see the note in get_pangolin_scores.
+    features_db = gffutils.FeatureDB(PANGOLIN_ANNOTATION_PATHS[(genome_version, basic_or_comprehensive_param)])
+    scores = process_position_using_pangolin(0, chrom, int(pos), features_db, PANGOLIN_MODELS, PangolinArgs)
+
+    if not scores:
+        return {
+            "variant": variant,
+            "source": "pangolin",
+            "error": f"Pangolin was unable to compute scores for this position",
+        }
+
+    candidate_transcripts = []
+    for transcript_scores in scores:
+        transcript_id_without_version = transcript_scores.get("NAME", "").split(".")[0]
+
+        transcript_annotations = SHARED_TRANSCRIPT_ANNOTATIONS[(genome_version, basic_or_comprehensive_param)].get(transcript_id_without_version)
+        if transcript_annotations is None:
+            raise ValueError(f"Missing annotations for {transcript_id_without_version} in {genome_version} annotations")
+
+        transcript_scores.update(transcript_annotations)
+        candidate_transcripts.append(transcript_scores)
+
+    # Select transcript: highest priority, then highest |S_REF|
+    selected_transcript = None
+    best_priority = -1
+    best_score = -1.0
+    for transcript_scores in candidate_transcripts:
+        priority = TRANSCRIPT_PRIORITY_ORDER.get(transcript_scores.get('t_priority', 'N'), 0)
+        score = abs(float(transcript_scores['S_REF']))
+        if priority > best_priority or (priority == best_priority and score > best_score):
+            selected_transcript = transcript_scores
+            best_priority = priority
+            best_score = score
+
+    all_non_zero_scores = selected_transcript["ALL_NON_ZERO_SCORES"] if selected_transcript else None
+    all_non_zero_scores_strand = selected_transcript["STRAND"] if selected_transcript else None
+    all_non_zero_scores_transcript_id = selected_transcript["NAME"] if selected_transcript else None
+
+    for transcript_scores in candidate_transcripts:
+        for redundant_key in ("NAME", "STRAND", "ALL_NON_ZERO_SCORES"):
+            transcript_scores.pop(redundant_key, None)
+
+    return {
+        "variant": variant,
+        "genomeVersion": genome_version,
+        "chrom": chrom,
+        "pos": pos,
+        "distance": distance_param,
+        "scores": scores,
+        "source": "pangolin:model",
+        "isPositionOnly": True,
+        "allNonZeroScores": all_non_zero_scores,
+        "allNonZeroScoresStrand": all_non_zero_scores_strand,
+        "allNonZeroScoresTranscriptId": all_non_zero_scores_transcript_id,
     }
 
 
@@ -1087,19 +2032,76 @@ def run_pangolin():
     return run_splice_prediction_tool(tool_name="pangolin")
 
 
+@app.route("/spliceai/scores/", strict_slashes=False, methods=['POST', 'GET'])
+def run_spliceai_scores():
+    return run_splice_prediction_tool(tool_name="spliceai", scores_for_one_transcript=True)
+
+
+@app.route("/pangolin/scores/", strict_slashes=False, methods=['POST', 'GET'])
+def run_pangolin_scores():
+    return run_splice_prediction_tool(tool_name="pangolin", scores_for_one_transcript=True)
+
+
+def per_transcript_scores_response(results, transcript_id, tool_name):
+    """Build the /scores response: the per-position rows for a single transcript.
+
+    The rows are read out of the same cached result the main endpoint produced, so opening the
+    per-position table for a transcript never re-runs the model.
+
+    Args:
+        results (dict): a full result dict, from the cache or freshly computed.
+        transcript_id (str): the t_id to return rows for, e.g. "ENST00000234420.11".
+        tool_name (str): "spliceai" or "pangolin".
+
+    Returns:
+        A flask Response.
+    """
+    if "error" in results:
+        return error_response(results["error"], source=tool_name)
+
+    # run_splice_prediction_tool now checks this before the model runs, so this is a backstop for
+    # any future caller rather than the path a bad request takes. Kept because dropping it would
+    # let a None reach the loop below and answer with 'Transcript "None" not found'.
+    if not transcript_id:
+        return error_response('"transcript" not specified.\n', source=tool_name)
+
+    if results.get("isPositionOnly"):
+        return error_response("Per-position scores are not available for position-only queries.\n", source=tool_name)
+
+    for transcript_scores in results.get("scores") or []:
+        if transcript_scores.get("t_id") == transcript_id:
+            return Response(json.dumps({
+                "transcript": transcript_id,
+                "strand": transcript_scores.get("t_strand"),
+                "rows": transcript_scores.get("ALL_NON_ZERO_SCORES") or [],
+            }), status=200, mimetype='application/json', headers=[
+                ('Access-Control-Allow-Origin', '*'),
+            ])
+
+    return error_response(f'Transcript "{transcript_id}" not found in the results for this variant.\n', source=tool_name)
+
+
 _FIRST_REQUEST_LOGGED = False
 
 
-def run_splice_prediction_tool(tool_name):
+def run_splice_prediction_tool(tool_name, scores_for_one_transcript=False):
     """Handles API request for splice prediction.
 
     DB connections are taken from the pool only for short bursts (cache lookup,
     rate-limit check, log writes, cache writes, and per-call transcript-structure
-    SELECTs inside get_spliceai_scores). The model inference runs without holding
-    any pooled connection, so a slow inference can't starve the pool.
+    SELECTs inside get_spliceai_scores and get_pangolin_scores). The model inference
+    runs without holding any pooled connection, so a slow inference can't starve the pool.
 
     Args:
         tool_name (str): "spliceai" or "pangolin"
+        scores_for_one_transcript (bool): when True, respond with just the per-position rows
+            for the transcript named by the "transcript" param (the /scores endpoints) instead
+            of the full results. Everything up to that point -- param validation, rate limiting,
+            the cache lookup and the cache write -- is shared with the main endpoint, so a
+            /scores call for an already-computed variant is a cache read whenever caching is
+            available. On an instance with no database attached (DATABASE_ENABLED is False
+            unless DB_PASSWORD is set), the cache lookup always misses and the variant is
+            recomputed from scratch.
     """
 
     global _FIRST_REQUEST_LOGGED
@@ -1158,40 +2160,124 @@ def run_splice_prediction_tool(tool_name):
         return error_response(f'Invalid "distance": "{distance_param}". The value must be non-negative.\n', source=tool_name)
 
     if distance_param > MAX_DISTANCE_LIMIT:
-        return error_response(f'Invalid "distance": "{distance_param}". The value must be < {MAX_DISTANCE_LIMIT}.\n', source=tool_name)
+        return error_response(f'Invalid "distance": "{distance_param}". The value must be at most {MAX_DISTANCE_LIMIT}.\n', source=tool_name)
 
     mask_param = params.get("mask", str(DEFAULT_MASK))
     if mask_param not in ("0", "1"):
         return error_response(f'Invalid "mask" value: "{mask_param}". The value must be either "0" or "1". For example: {example_url}\n', source=tool_name)
 
-    basic_or_comprehensive_param = params.get("bc", "basic")
+    # Default to the gene set this instance actually serves, so only an explicit "bc" that
+    # disagrees with GENE_SET triggers the redirect/refusal below. Defaulting to "basic"
+    # would make every bc-less request to a comprehensive instance look like a request for
+    # the other gene set.
+    basic_or_comprehensive_param = params.get("bc", GENE_SET)
     if basic_or_comprehensive_param not in ("basic", "comprehensive"):
         return error_response(f'Invalid "bc" value: "{basic_or_comprehensive_param}". The value must be either "basic" or "comprehensive". For example: {example_url}\n', source=tool_name)
 
-    variant_consequence = params.get("variant_consequence")
+    # Each service pins one gene set (see GENE_SET) and loads only that annotator, so a request
+    # for the other one has to be answered by the service that has it. Redirect rather than
+    # refuse: these un-suffixed URLs served both gene sets for years and are published in the
+    # docs, so scripted clients that predate the split still send bc=comprehensive here. A 307
+    # preserves the method and body, and every common HTTP client (requests, curl -L, httr,
+    # XMLHttpRequest, fetch) follows it, so those callers keep working against the old URL.
+    if basic_or_comprehensive_param != GENE_SET:
+        other_service = f"{tool_name}-{GENOME_VERSION}" + ("" if basic_or_comprehensive_param == "basic" else "-comprehensive")
+        # K_SERVICE is the service's real name, set by Cloud Run. Comparing against a name
+        # derived from GENE_SET instead would be worthless: the two are equal by construction
+        # whenever the bc check above fails, so it could never catch the case that matters --
+        # a container deployed under a service name that disagrees with its own GENE_SET, which
+        # would redirect to itself and loop until the client gives up.
+        this_service = os.environ.get("K_SERVICE", "")
+        if this_service and this_service == other_service:
+            return error_response(
+                f"This service is misconfigured: it is deployed as {this_service} but runs with "
+                f"GENE_SET={GENE_SET}. Redeploy it with the matching GENE_SET.\n",
+                source=tool_name, status=500)
+        # Rewrite the service name inside the host actually requested, rather than hardcoding
+        # the production host, so a request that arrived at a `dev---`-tagged revision is
+        # redirected to the sibling's dev revision and stays on the dev side of the fence.
+        #
+        # When the requested host carries no service name to rewrite, there is no sibling that is
+        # knowably part of this deployment, so refuse instead of guessing. That case is a
+        # self-hosted container, where the other gene set is a restart away: README.md documents
+        # `-e GENE_SET=comprehensive` for exactly that, which is what the error below tells the
+        # user to do. Redirecting to the public Cloud Run hostname instead would send that user's
+        # variants off their own machine to the shared public API, which is what self-hosting
+        # exists to avoid, and would spend their IP's rate-limit budget there. Gating on
+        # RUNNING_ON_GOOGLE_CLOUD_RUN would not work: the Dockerfiles bake it into the image that
+        # a local `docker run` uses too.
+        if not (this_service and this_service in request.host):
+            return error_response(
+                f'This instance serves only the "{GENE_SET}" Gencode gene set, and this request '
+                f'asked for "{basic_or_comprehensive_param}". Start a container with '
+                f'GENE_SET={basic_or_comprehensive_param} to compute those annotations locally, '
+                f'or query https://{other_service}-xwkwwwxdwq-uc.a.run.app to use the public '
+                f'service.\n', source=tool_name)
+        target_host = request.host.replace(this_service, other_service, 1)
+        print(f"{logging_prefix}: redirecting bc={basic_or_comprehensive_param} request to {target_host}", flush=True)
+        return redirect(f"https://{target_host}{request.full_path}", code=307)
+
+    # Checked here rather than where the value is used, in per_transcript_scores_response: that
+    # call happens after the cache lookup, the rate-limit check, the model run and the cache
+    # write, so a /scores request that forgot "transcript" used to pay a full inference (up to
+    # the image's 870s gunicorn timeout at distance=10000) before being told it was malformed.
+    # These endpoints are public and unauthenticated. After the redirect block, so a request
+    # aimed at the wrong gene set is still forwarded to the service that can answer it.
+    if scores_for_one_transcript and not params.get("transcript"):
+        return error_response('"transcript" not specified.\n', source=tool_name)
+
+    # A bare chrom-pos position (no ref/alt) requests REF-only scores instead
+    # of the usual REF-vs-ALT delta scores. Try the full variant format first
+    # so a well-formed variant is never misparsed as a position.
+    try:
+        parse_variant(variant)
+        is_position_only = False
+    except ValueError:
+        try:
+            parse_position(variant)
+            is_position_only = True
+        except ValueError:
+            return error_response(
+                f'Unable to parse "variant": "{variant}". Expected either a chrom-pos-ref-alt variant '
+                f'(e.g. chr8-140300615-C-G) or a chrom-pos position (e.g. chr8-140300615) for REF-only scores.\n',
+                source=tool_name)
 
     force = params.get("force")  # ie. don't use cache
 
     print(f"{logging_prefix}: ======================", flush=True)
     print(f"{logging_prefix}: {variant} tool={tool_name} hg={genome_version}, distance={distance_param}, mask={mask_param}, bc={basic_or_comprehensive_param}", flush=True)
 
-    if tool_name == "spliceai":
-        init_spliceai(genome_version, basic_or_comprehensive_param)
+    # Everything this service can serve was loaded at startup by preload_models(), so the
+    # annotator and transcript annotations are ready here and the first request is as fast as
+    # the thousandth. (get_pangolin_scores still calls init_pangolin(), which returns
+    # immediately once the models are cached; it stays as a guard for direct callers.) That the
+    # gene set is fixed at startup is also why a request for the other one is redirected above
+    # rather than served: nothing is loaded here that could answer it.
 
-    init_transcript_annotations(genome_version, basic_or_comprehensive_param)
+    # Score the variant's shortest spelling, and look it up in the cache under that spelling, so every
+    # equivalent spelling of it gets the same scores (see get_spelling_to_score). The response still
+    # echoes the requested spelling in "variant", while its "pos", "ref" and "alt" name the spelling that
+    # was scored, which the positions in the scores are measured from.
+    requested_variant = variant
+    if not is_position_only:
+        chrom, pos, ref, alt = parse_variant(variant)
+        scored_pos, scored_ref, scored_alt = get_spelling_to_score(chrom, pos, ref, alt, genome_version)
+        if (scored_pos, scored_ref, scored_alt) != (pos, ref, alt):
+            variant = f"{chrom}-{scored_pos}-{scored_ref}-{scored_alt}"
+            print(f"{logging_prefix}: scoring {requested_variant} as its shortest spelling, {variant}", flush=True)
 
     # check cache before processing the variant (short DB scope)
     results = {}
     if not force:
         with get_db_connection() as conn:
-            results = get_splicing_scores_from_cache(conn, tool_name, variant, genome_version, distance_param, mask_param, basic_or_comprehensive_param)
+            results = get_splicing_scores_from_cache(conn, tool_name, variant, genome_version, distance_param, mask_param, basic_or_comprehensive_param, is_position_only)
 
     if results:
         # Cache hit: brief log scope, then fall through to response building.
         with get_db_connection() as conn:
-            log(conn, f"{tool_name}:from-cache", ip=user_ip, variant=variant, genome=genome_version, distance=distance_param, mask=mask_param, bc=basic_or_comprehensive_param, variant_consequence=variant_consequence)
+            log(conn, f"{tool_name}:from-cache", ip=user_ip, variant=variant, genome=genome_version, distance=distance_param, mask=mask_param, bc=basic_or_comprehensive_param)
             if "error" in results:
-                log(conn, f"{tool_name}:error", ip=user_ip, variant=variant, genome=genome_version, distance=distance_param, mask=mask_param, details=results["error"], bc=basic_or_comprehensive_param, variant_consequence=variant_consequence)
+                log(conn, f"{tool_name}:error", ip=user_ip, variant=variant, genome=genome_version, distance=distance_param, mask=mask_param, details=results["error"], bc=basic_or_comprehensive_param)
     else:
         # Rate-limit check (short DB scope).
         with get_db_connection() as conn:
@@ -1201,10 +2287,17 @@ def run_splice_prediction_tool(tool_name):
             return error_response(error_message, source=tool_name, status=429)
 
         # Model inference runs without a pooled DB connection. get_spliceai_scores
-        # acquires its own short-lived connection internally for transcript-structure
-        # SELECTs after inference completes; get_pangolin_scores does no DB work.
+        # and get_pangolin_scores each acquire their own short-lived connection
+        # internally for transcript-structure SELECTs after inference completes.
         try:
-            if tool_name == "spliceai":
+            if is_position_only:
+                if tool_name == "spliceai":
+                    results = get_spliceai_reference_scores(variant, genome_version, distance_param, basic_or_comprehensive_param)
+                elif tool_name == "pangolin":
+                    results = get_pangolin_reference_scores(variant, genome_version, distance_param, basic_or_comprehensive_param)
+                else:
+                    raise ValueError(f"Invalid tool_name: {tool_name}")
+            elif tool_name == "spliceai":
                 results = get_spliceai_scores(variant, genome_version, distance_param, int(mask_param), basic_or_comprehensive_param)
             elif tool_name == "pangolin":
                 pangolin_mask_param = "True" if mask_param == "1" else "False"
@@ -1229,19 +2322,28 @@ def run_splice_prediction_tool(tool_name):
             )
 
         # Strip the internal sentinel before anything downstream sees `results`.
-        # Set by get_spliceai_scores when the per-request DB connection couldn't
-        # be acquired, so the transcript-structure enrichment was skipped and
-        # the result reflects degraded inputs — don't cache it.
+        # Set by get_spliceai_scores or get_pangolin_scores when the transcript-structure
+        # lookup couldn't run (no DB connection, or the query failed), so that enrichment
+        # was skipped and the result reflects degraded inputs — don't cache it.
         skip_cache = results.pop("_skip_cache", False)
 
         # Post-inference: log + cache write + (if error) error log, all in one short DB scope.
         duration = (datetime.now() - start_time).total_seconds()
         with get_db_connection() as conn:
-            log(conn, f"{tool_name}:computed", ip=user_ip, duration=duration, variant=variant, genome=genome_version, distance=distance_param, mask=mask_param, bc=basic_or_comprehensive_param, variant_consequence=variant_consequence)
+            log(conn, f"{tool_name}:computed", ip=user_ip, duration=duration, variant=variant, genome=genome_version, distance=distance_param, mask=mask_param, bc=basic_or_comprehensive_param)
             if "error" not in results and not skip_cache:
-                add_splicing_scores_to_cache(conn, tool_name, variant, genome_version, distance_param, mask_param, basic_or_comprehensive_param, results)
+                add_splicing_scores_to_cache(conn, tool_name, variant, genome_version, distance_param, mask_param, basic_or_comprehensive_param, results, is_position_only)
             elif "error" in results:
-                log(conn, f"{tool_name}:error", ip=user_ip, variant=variant, genome=genome_version, distance=distance_param, mask=mask_param, details=results["error"], bc=basic_or_comprehensive_param, variant_consequence=variant_consequence)
+                log(conn, f"{tool_name}:error", ip=user_ip, variant=variant, genome=genome_version, distance=distance_param, mask=mask_param, details=results["error"], bc=basic_or_comprehensive_param)
+
+    if scores_for_one_transcript:
+        return per_transcript_scores_response(results, params.get("transcript"), tool_name)
+
+    # The per-position rows are kept in the cached copy (see get_spliceai_scores) but not sent
+    # with the main response: the results table only needs nNonZeroScores, and the /scores
+    # endpoints serve the rows for whichever transcript the user opens.
+    for transcript_scores in results.get("scores") or []:
+        transcript_scores.pop("ALL_NON_ZERO_SCORES", None)
 
     # Echo only a whitelist of input params back to the client. A prior version
     # used `response_json.update(params)`, which reflected every query-string
@@ -1249,10 +2351,18 @@ def run_splice_prediction_tool(tool_name):
     # the URL-hash auto-submit on page load, that let a crafted link execute
     # arbitrary HTML in visitors' browsers.
     ECHO_PARAM_KEYS = (
-        "variant", "hg", "bc", "distance", "mask", "raw", "variant_consequence",
+        "variant", "hg", "bc", "distance", "mask", "raw",
     )
     response_json = {k: params[k] for k in ECHO_PARAM_KEYS if k in params}
+    # REF-only (position-only) results never set a "mask" key (mask has no meaning
+    # without an ALT allele) -- drop a client-supplied mask echo too, so the response
+    # never implies a mask value was applied when it wasn't.
+    if is_position_only:
+        response_json.pop("mask", None)
     response_json.update(results)
+    # results names the spelling that was scored, which is shorter than the requested one when the
+    # request had unchanged bases to trim (see the get_spelling_to_score call above)
+    response_json["variant"] = requested_variant
 
     response_log_string = ", ".join([f"{k}: {v}" for k, v in response_json.items() if not k.startswith("allNonZeroScores")])
     print(f"{logging_prefix}: {variant} response took {str(datetime.now() - start_time)}: {response_log_string}", flush=True)
@@ -1262,7 +2372,7 @@ def run_splice_prediction_tool(tool_name):
     ])
 
 
-def log(conn, event_name, ip=None, duration=None, variant=None, genome=None, distance=None, mask=None, bc=None, details=None, variant_consequence=None):
+def log(conn, event_name, ip=None, duration=None, variant=None, genome=None, distance=None, mask=None, bc=None, details=None):
     """Utility method for logging an event"""
 
     try:
@@ -1275,8 +2385,8 @@ def log(conn, event_name, ip=None, duration=None, variant=None, genome=None, dis
 
     try:
         run_sql(conn,
-                r"INSERT INTO log (event_name, ip, duration, variant, genome, distance, mask, bc, details, variant_consequence) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (event_name, ip, duration, variant, genome, distance, mask, bc, details, variant_consequence))
+                r"INSERT INTO log (event_name, ip, duration, variant, genome, distance, mask, bc, details) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (event_name, ip, duration, variant, genome, distance, mask, bc, details))
     except Exception as e:
         print(f"Log error: {e}", flush=True)
 
@@ -1329,7 +2439,6 @@ def log_event(name):
     mask_param = params.get("mask")
     basic_or_comprehensive_param = params.get("bc")
     details = params.get("details")
-    variant_consequence = params.get("variant_consequence")
     if details:
         details = str(details)
         details = details[:2000]
@@ -1348,8 +2457,7 @@ def log_event(name):
             distance=distance_param,
             mask=mask_param,
             bc=basic_or_comprehensive_param,
-            details=details,
-            variant_consequence=variant_consequence)
+            details=details)
 
     return Response(json.dumps({"status": "Done"}), status=200, mimetype='application/json', headers=[
         ('Access-Control-Allow-Origin', '*'),
@@ -1358,10 +2466,24 @@ def log_event(name):
 
 @app.route('/', strict_slashes=False)
 def index():
-    # Bare-root probes (uptime checkers, scanners polling `*.run.app/`) would
-    # otherwise generate 404 noise that drowns out real client errors in the
-    # monitoring breakdown. Return a tiny 200 so they look like normal traffic.
+    # Bare-root probes (scanners polling `*.run.app/`) would otherwise generate
+    # 404 noise that drowns out real client errors in the monitoring breakdown.
+    # Return a tiny 200 so they look like normal traffic.
     return Response("OK\n", status=200, mimetype='text/plain')
+
+
+@app.route('/uptime/', strict_slashes=False)
+def uptime():
+    # The endpoint the Cloud Monitoring uptime checks probe, and the reason it answers 204
+    # rather than 200: run.googleapis.com/request_count is only labelled by status code, with
+    # no path or user-agent, so the only way the monitoring report can tell a probe from real
+    # traffic is to give probes a status code nothing else returns. Six checker regions every
+    # 300s is ~1,700 requests/day/service, which is larger than a quiet service's entire real
+    # volume — pooled into 2xx it would bury the 5xx rate, and pooled into 4xx (what probing
+    # /spliceai/ with no parameters used to do) it buried genuine client errors instead. No
+    # endpoint here answers 204 to a real caller, so monitor_google_cloud_run_latency_stats_
+    # and_errors.py can drop 204 and nothing else. Keep the two in sync if this ever changes.
+    return Response(status=204)
 
 
 @app.route('/<path:path>/')
@@ -1377,6 +2499,77 @@ def catch_all(path):
     )
 
 
+def preload_models():
+    """Load everything this service can serve, before it accepts any request.
+
+    A service answers for exactly one (GENOME_VERSION, GENE_SET) pair, so the full set is known
+    at startup and there is nothing left to load lazily. That is the point: no user's request
+    pays a model load, and a container that cannot load its models fails at startup instead of
+    500ing on the unlucky first request. (get_pangolin_scores still calls init_pangolin(), but
+    it returns immediately once this has run; it remains only as a guard for direct callers.)
+
+    This must run in the WORKER, not in the gunicorn arbiter, which is why the Dockerfiles no
+    longer pass `--preload`: without it gunicorn imports this module separately in each worker
+    after forking, so each worker builds its own copies. That is deliberate. Annotator.__init__
+    opens the reference FASTA with pyfastx (an open file descriptor plus a sqlite .fxi index)
+    and loads 5 Keras models, and neither a sqlite connection nor the TensorFlow runtime
+    survives fork(): sharing them across forked workers hung every SpliceAI inference until
+    gunicorn's --timeout killed the worker, turning each request into a 503. The DB pool comment
+    above describes the same hazard for psycopg2, and takes the same way out.
+
+    The cost of not forking shared copies is that each worker holds its own annotator. Pinning
+    one gene set per service is what makes that affordable: a worker can no longer accumulate
+    both, which is what exhausted the instance's memory before the split.
+
+    Failures are fatal on Cloud Run, where a container that cannot load its models has nothing
+    to serve and should be replaced rather than left to 500. Off Cloud Run they are only warned
+    about, because the model files live at absolute paths that exist inside the image and
+    nowhere else: raising there would make `import server` impossible for the unit tests that
+    exercise its pure helpers (test_position_only.py imports the module for exactly that).
+    """
+    t0 = time.time()
+    try:
+        if TOOL == "spliceai":
+            init_spliceai(GENOME_VERSION, GENE_SET)
+        elif TOOL == "pangolin":
+            init_pangolin()
+        init_transcript_annotations(GENOME_VERSION, GENE_SET)
+    except (OSError, SystemExit) as e:
+        # Deliberately only these two, and only off Cloud Run: the sole failure meant to be
+        # tolerated is "the model/annotation files aren't on this machine", which is the normal
+        # state of a checkout outside the image. Any other exception is a defect in this code
+        # and must still surface at import, or the unit tests that import server.py would
+        # silently pass over a real regression.
+        #
+        # SystemExit is in the list because SpliceAI reports that same missing-file condition by
+        # calling exit() rather than by letting the OSError propagate: spliceai/utils.py catches
+        # its own IOError when the annotation table or the FASTA is absent, prints, and exits.
+        # SystemExit derives from BaseException, so `except OSError` alone let it straight through
+        # and killed the interpreter at import instead of printing the warning below.
+        if RUNNING_ON_GOOGLE_CLOUD_RUN:
+            raise
+        print(f"WARNING: preload of the hg{GENOME_VERSION} {GENE_SET} models failed: "
+              f"{type(e).__name__}: {e}. Continuing because this is not a Cloud Run container, so "
+              f"the module is importable for unit tests, but this instance cannot serve requests.",
+              flush=True)
+        return
+    # MODEL_COMMIT is reported here because it is baked into the image by the Dockerfile rather
+    # than set at deploy time, so it does not appear in the revision's environment and this
+    # startup line is the only place a deploy can be checked against the commit it was meant to
+    # ship. An empty value means the ARG did not reach the ENV, which would silently leave the
+    # cache keyed as though the model were unknown.
+    print(f"[startup pid={os.getpid()}] preload_models() ready for hg{GENOME_VERSION} {GENE_SET} "
+          f"model_commit={MODEL_COMMIT or '(unset)'} in {time.time() - t0:.2f}s", flush=True)
+
+
+preload_models()
+
+# Move everything loaded above into the GC's permanent generation, which the collector never
+# walks again. The transcript annotations alone are hundreds of thousands of nested dicts that
+# live for the life of the process, and every full collection would otherwise re-traverse all
+# of them to prove what is already known: none of it is garbage.
+gc.freeze()
+
 print(f"[startup pid={os.getpid()}] server.py module loaded in "
       f"{time.time() - _PROCESS_START_TIME:.2f}s (tool={TOOL}, genome={GENOME_VERSION})", flush=True)
 
@@ -1389,4 +2582,7 @@ print(f"[startup pid={os.getpid()}] server.py module loaded in "
 # workers — silently defeating the gunicorn worker recycling (--timeout 120) this
 # image relies on to recover from stuck inferences.
 if __name__ == '__main__':
-    app.run(debug=DEBUG, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+    # threaded=False because Flask's default is threaded=True, which would serve overlapping
+    # requests from threads sharing the pyfastx handles that _assert_one_request_per_process
+    # exists to protect (the guard cannot see this path: no gunicorn worker module is loaded).
+    app.run(debug=DEBUG, host='0.0.0.0', port=int(os.environ.get('PORT', 8080)), threaded=False)

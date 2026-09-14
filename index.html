@@ -7,6 +7,10 @@
         //    baseApiUrl = location.origin
         //}
 
+        // Each service answers for one genome and one Gencode gene set, so the key is
+        // "<tool>-<hg>" for the basic gene set and "<tool>-<hg>-comprehensive" for the other.
+        // Local spliceai containers accept both gene sets on one URL; Pangolin comprehensive
+        // uses Broad's separate Cloud Run services.
         const baseApiUrl = {
             "normalize": "https://liftover-xwkwwwxdwq-uc.a.run.app",
             "pangolin-37": "https://pangolin-37-xwkwwwxdwq-uc.a.run.app",
@@ -15,6 +19,10 @@
             "spliceai-37": "/spliceai-lookup/api/37",
             // "spliceai-38": "https://spliceai-38-xwkwwwxdwq-uc.a.run.app",
             "spliceai-38": "/spliceai-lookup/api/38",
+            "pangolin-37-comprehensive": "https://pangolin-37-comprehensive-xwkwwwxdwq-uc.a.run.app",
+            "pangolin-38-comprehensive": "https://pangolin-38-comprehensive-xwkwwwxdwq-uc.a.run.app",
+            "spliceai-37-comprehensive": "/spliceai-lookup/api/37",
+            "spliceai-38-comprehensive": "/spliceai-lookup/api/38",
         }
 
         // Route spliceai/pangolin requests to their 'dev'-tagged Cloud Run
@@ -32,7 +40,7 @@
         )
         const _apiMatch = window.location.hash.match(/[?&#]api=([^&#]*)/)
         if (_servedFromDevSite || (_apiMatch && _apiMatch[1] === "dev")) {
-            for (const k of ["pangolin-37", "pangolin-38", "spliceai-37", "spliceai-38"]) {
+            for (const k of Object.keys(baseApiUrl)) {
                 baseApiUrl[k] = baseApiUrl[k].replace(/^https:\/\//, "https://dev---")
             }
             console.log("Routing spliceai/pangolin requests to dev revisions:", baseApiUrl)
@@ -93,6 +101,8 @@
                                 <a id="more-details1-button" href="#" style="float:right; padding-right:7px" onclick="$('#more-details1').show();$('#more-details1-button').hide();">[more details]</a>
                                 <div id="more-details1" style="display:none">
                                     <br />
+                                    We use the <a href="https://genebe.net" target="_blank">GeneBe API</a> to convert HGVS notation to genomic coordinates for hg38, and to provide variant consequences for both hg19 and hg38. The Ensembl API is still used to convert HGVS notation for hg19, and as a fallback when GeneBe cannot convert an HGVS variant.<br />
+                                    <br />
                                     <a href="https://github.com/illumina/SpliceAI" target="_blank">SpliceAI</a> is a copyrighted work by Illumina and is provided under GPLv3 and CC BY NC 4.0 licenses for academic and non-commercial use.
                                     This web service is an adjusted deployment based on the open-source <a href="https://github.com/broadinstitute/SpliceAI-lookup" target="_blank">SpliceAI-lookup</a> project and is provided 
                                     by Charité - Institut für Medizinische Genetik und Humangenetik.<br />
@@ -126,6 +136,7 @@
                                     <tbody>
                                     <tr><td style="padding-right: 0px">NM_001089.3(ABCA3):c.875A>T (p.Glu292Val)</td></tr>
                                     <tr><td>chr8-140300616-T-G</td><td></td></tr>
+                                    <tr><td>chr8:140300616</td><td><i>position-only (REF scores)</i></td></tr>
                                     <tr>
                                         <td>6 &nbsp; 31740453 &nbsp; G &nbsp; T</td><td></td>
                                         <td style="padding-left: 0px; padding-right:7px;">
@@ -158,11 +169,11 @@
                         <!--- variant input field --->
                         <div class="ui form" style="width:100%">
                             <div class="no-print" style="padding-bottom:8px; color: #555;">
-                                Enter one or more variants (one per line; same formats as the examples below), or upload a plain-text <code>.vcf</code>. Up to 75 variants per submit.
+                                Enter one or more variants (one per line; same formats as the examples below), or a chrom:position to see REF scores, or upload a plain-text <code>.vcf</code>. Up to 75 variants per submit.
                                 <span class="only-large-screen"> Ctrl+Enter (⌘+Enter on Mac) submits from the text box.</span>
                             </div>
                             <div class="ui input" style="padding-bottom:14px; padding-right:8px; width:100%">
-                                <textarea id="variants-textarea" rows="6" style="width: 100%; padding: 7px 10px; font-family: inherit;" placeholder="e.g. chr8-140300616-T-G or NM_000249.4(MLH1):c.116G>A — or paste several lines"></textarea>
+                                <textarea id="variants-textarea" rows="6" style="width: 100%; padding: 7px 10px; font-family: inherit;" placeholder="e.g. chr8-140300616-T-G, chr8:140300616, or NM_000249.4(MLH1):c.116G>A — or paste several lines"></textarea>
                             </div>
                             <div class="field" style="padding-bottom:24px;">
                                 <label for="batch-vcf-file" style="margin-right: 10px;">VCF file</label>
@@ -231,6 +242,15 @@
                 <div>
                     <a href="https://github.com/broadinstitute/SpliceAI-lookup/issues" target="_blank">SpliceAI-lookup/issues</a>: issues or feature requests for this website<br />
                     <br/>
+                    <b>August, 2026</b>
+                    <br />
+                    - Switched to the <a href="https://genebe.net" target="_blank">GeneBe API</a> for faster variant consequence lookup on both hg19 and hg38 as well as HGVS conversion on hg38, while still using <a href="https://useast.ensembl.org/info/docs/tools/vep/index.html" target="_blank">Ensembl VEP API</a> for HGVS on hg19.<br/>
+                    - A new <i class="table icon" style="color:#000080"></i> icon in the results shows every position in the scoring window that has a non-zero SpliceAI or Pangolin score.<br/>
+                    - Can now search for chrom:position to see REF scores (eg. <a href="#variant=8%3A140300616&hg=38&bc=basic&distance=5000&mask=0&ra=0">chr8:140300616</a>)<br/>
+                    <br />
+                    <a id="more-details3-button" href="#"
+                       onclick="$('#more-details3').show();$('#more-details3-button').hide();">[show older updates]</a>
+                    <div id="more-details3" style="display:none">
                     <b>July 1st, 2026</b>
                     <br />
                     - improved SpliceAI-10k output when SpliceAI predicts multiple acceptor/donor shifts (examples: <a href="https://spliceailookup.broadinstitute.org/#variant=NM_024675.4(PALB2)%3Ac.47A%3EG&hg=38&bc=basic&distance=500&mask=0&ra=0" target="_blank">NM_024675.4(PALB2):c.47A>G</a>, <a href="https://spliceailookup.broadinstitute.org/#variant=NM_000546.6(TP53)%3Ac.673-1G%3EA&hg=38&bc=basic&distance=500&mask=0&ra=0" target="_blank">NM_000546.6(TP53):c.673-1G>A</a>)<br/>
@@ -240,9 +260,6 @@
                     - Added <a href="https://academic.oup.com/bioinformatics/article/39/4/btad179/7109800" target="_blank">SpliceAI-10k Calculator</a> predictions<br/>
 		    - Updated list of Related web tools<br />
                     <br />		    
-                    <a id="more-details3-button" href="#"
-                       onclick="$('#more-details3').show();$('#more-details3-button').hide();">[show older updates]</a>
-                    <div id="more-details3" style="display:none">
                         <b>December 14, 2025</b>
 			<br />
 			- In the 'Other scores' section, only populate the 'Points' column for missense variants since the calibration was only done for missense<br/>
@@ -354,6 +371,11 @@
                         <div id="batch-analysis-progress-fill" class="batch-analysis-progress-fill"></div>
                     </div>
                 </div>
+                <!-- Which external API a search is currently waiting on (HGVS conversion, scoring) -->
+                <div id="progress-box" style="color:#555555; padding:10px 0px; font-size:medium; display: none"></div>
+                <!-- Notes that qualify the results below them, eg. which allele a dbSNP id resolved
+                     to, so they sit above the tables rather than in #error-box underneath them -->
+                <div id="notes-box" style="color:#555555; padding:10px 0px; font-size:medium; display: none"></div>
                 <div id="response-box" style="display: none">
                     <div id="batch-nav" class="batch-variant-nav" style="display: none">
                         <button type="button" id="batch-prev-btn" class="ui button" aria-label="Previous variant">← Prev</button>
@@ -388,7 +410,7 @@
                             </th>
                         </tr>
                         <tr>
-                            <th class="table-header">Variant</th>
+                            <th class="table-header" id="spliceai-variant-header">Variant</th>
                             <th class="table-header" style="white-space: nowrap">Transcript
                                 <div style="float:right;">
                                     <span class='transcript-color-legend'
@@ -399,11 +421,11 @@
                                     = non-coding transcript
                                 </div>
                             </th>
-                            <th class="table-header">&#916;&nbsp; type</th>
-                            <th class="table-header" style="white-space: nowrap">&#916;&nbsp; score &nbsp; <i class='question circle outline icon'
+                            <th class="table-header"><span id="spliceai-type-header-label">&#916;&nbsp; type</span></th>
+                            <th class="table-header" style="white-space: nowrap"><span id="spliceai-score-header-label">&#916;&nbsp; score &nbsp; </span><i class='question circle outline icon' id="spliceai-score-header-icon"
                                                                                  data-html="Delta scores range from 0 to 1 and can be interpreted as the probability that the variant affects splicing at any position within a window around it (+/- 500bp by default). In the SpliceAI paper, a detailed characterization is provided for 0.2 (high recall), 0.5 (recommended), and 0.8 (high precision) cutoffs. Consequently, scores of 0.2 or higher appear in <b style='color:#1fb839'>green</b>, 0.5 or higher appear in <b style='color:#FFCB1F'>yellow</b>, and 0.8 or higher appear in <b style='color:#FF0000'>red</b>."></i>
                             </th>
-                            <th class="table-header" style="white-space: nowrap">position &nbsp; <i class='question circle outline icon'
+                            <th class="table-header" style="white-space: nowrap"><span id="spliceai-position-header-label">position &nbsp; </span><i class='question circle outline icon' id="spliceai-position-header-icon"
                                                                                 data-content="For each variant, SpliceAI looks within a window (+/- 500bp by default) to see how the variant affects the probability of different positions serving as splice acceptors or donors. The offsets in this column represent positions with the biggest change in probability within the window. Negative values are to the left of the variant in genomic coords, regardless of transcript strand."></i>
                             </th>
                             <th class="table-header ref-score-column" style="white-space: nowrap">
@@ -427,13 +449,13 @@
                                 </th>
                             </tr>
                             <tr>
-                                <th class="table-header">Variant</th>
+                                <th class="table-header" id="pangolin-variant-header">Variant</th>
                                 <th class="table-header">Transcript</th>
-                                <th class="table-header">&#916;&nbsp; type</th>
-                                <th class="table-header" style="white-space: nowrap">&#916;&nbsp; score &nbsp; <i class='question circle outline icon'
+                                <th class="table-header"><span id="pangolin-type-header-label">&#916;&nbsp; type</span></th>
+                                <th class="table-header" style="white-space: nowrap"><span id="pangolin-score-header-label">&#916;&nbsp; score &nbsp; </span><i class='question circle outline icon' id="pangolin-score-header-icon"
                                                                                      data-html="Delta scores range from 0 to 1 and can be interpreted as the probability that the variant affects splicing at any position within a window around it (+/- 500bp by default). Pangolin does not recommend specific score thresholds; however, here scores of 0.2 or higher appear in <b style='color:#1fb839'>green</b>, 0.5 or higher appear in <b style='color:#FFCB1F'>yellow</b>, and 0.8 or higher appear in <b style='color:#FF0000'>red</b>."></i>
                                 </th>
-                                <th class="table-header" style="white-space: nowrap">position &nbsp; <i class='question circle outline icon'
+                                <th class="table-header" style="white-space: nowrap"><span id="pangolin-position-header-label">position &nbsp; </span><i class='question circle outline icon' id="pangolin-position-header-icon"
                                                                                     data-content="For each variant, Pangolin looks within a window (+/- 500bp by default) to see how the variant affects the probability of splicing occurring at different positions. The offsets in this column represent positions with the biggest change in probability within the window. Negative values are upstream (5&#039;) of the variant, and positive are downstream (3&#039;) of the variant."></i>
                                 </th>
                                 <th class="table-header ref-score-column" style="white-space: nowrap">
@@ -568,12 +590,25 @@
     </div>
 </div>
 
+<!-- Shared modal for the per-position score table. One element reused by every transcript's
+     table icon, with its heading and body replaced each time it's opened. -->
+<div id="per-position-modal" class="ui modal">
+    <i class="close icon"></i>
+    <div class="header">
+        <span id="per-position-modal-heading"></span>
+        <span id="per-position-header-buttons">
+            <button id="per-position-download-button" class="ui tiny basic button">
+                <i class="download icon"></i>Download CSV
+            </button>
+            <button id="per-position-visualize-button" class="ui primary tiny button"
+                    title="Go to the visualization section below. It draws the transcript the search selected, which is not necessarily this one.">
+                <i class="chart bar icon"></i>Visualize
+            </button>
+        </span>
+    </div>
+    <div id="per-position-modal-content" class="scrolling content"></div>
+</div>
+
 <script type="text/javascript" src="index.js"></script>
-<script>
-
-
-
-
-</script>
 </body>
 </html>

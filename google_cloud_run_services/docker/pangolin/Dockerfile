@@ -15,16 +15,36 @@ RUN apt update && apt-get install --no-install-recommends -y \
 # bundles CUDA/cuDNN/cuBLAS (~2 GB on disk) that we never use on Cloud Run.
 # Important: this must come before the requirements.txt install below; if
 # pip first resolves torch from PyPI it will pick the GPU build.
-RUN python3 -m pip install torch==2.2.1 --index-url https://download.pytorch.org/whl/cpu
+#
+# --extra-index-url, not --index-url: the latter REPLACES PyPI, so any build
+# dependency pip needs that the PyTorch index doesn't carry is simply
+# unfindable ("No matching distribution found for flit_core"). That failure
+# stayed hidden for as long as this layer was restored from the build cache
+# and only appeared once a cache miss forced a cold rebuild. Keeping PyPI in
+# the search path fixes it, and the explicit "+cpu" local version still pins
+# the CPU wheel unambiguously, since only the PyTorch index publishes it.
+RUN python3 -m pip install torch==2.2.1+cpu --extra-index-url https://download.pytorch.org/whl/cpu
 
 RUN apt update && apt-get install --no-install-recommends -y build-essential libpq-dev
 
 COPY docker/pangolin/requirements.txt /
 RUN python3 -m pip install --upgrade -r /requirements.txt
 
+# Pinned to a commit rather than whatever the default branch happens to be at build time, so a
+# rebuild cannot silently change the scores this service returns. See the equivalent comment in
+# docker/spliceai/Dockerfile. Bump deliberately, then re-run test_api_consistency.py against
+# the dev deployment.
+ARG PANGOLIN_COMMIT=860ab8003482cfa1138c4cb6cc5825b73df0b30a
 RUN git clone https://github.com/bw2/Pangolin.git \
     && cd Pangolin \
+	&& git checkout ${PANGOLIN_COMMIT} \
 	&& python3 -m pip install .
+
+# Carried into the container so server.py can mix it into the response cache key. Bumping the
+# pin above therefore retires the cached scores the previous model computed, without anyone
+# having to also bump CACHE_VERSION by hand -- a step whose omission failed silently, leaving
+# the service serving the retired model's scores.
+ENV MODEL_COMMIT=${PANGOLIN_COMMIT}
 
 ARG WORKERS="2"
 ARG GENOME_VERSION="unknown"
@@ -55,4 +75,7 @@ ENV RUNNING_ON_GOOGLE_CLOUD_RUN=1
 # complete instead of being killed. Trade-off: a sync worker (1 of WORKERS) is tied up for
 # up to 870s on such a request, lowering the instance's effective concurrency while it runs.
 # --graceful-timeout gives in-flight requests 30s to finish on restart.
-CMD exec gunicorn --preload --bind :$PORT --workers ${WORKERS} --threads 1 --timeout 870 --graceful-timeout 30 server:app
+#
+# No --preload: kept identical to the spliceai image so both tools load their models in the
+# worker rather than in the arbiter before the fork. See that Dockerfile and preload_models().
+CMD exec gunicorn --bind :$PORT --workers ${WORKERS} --threads 1 --timeout 870 --graceful-timeout 30 server:app

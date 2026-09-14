@@ -1740,12 +1740,19 @@ def _apply_variant_to_altered_exon_seqs(altered_exon_spans, exon_seqs, var_pos, 
     """Apply variant to the affected exon sequence (in genomic orientation).
 
     Returns one of:
-        "<exon_idx>_<modified_seq>"      — success; caller writes back into exon_seqs.
+        [(exon_idx, modified_seq), ...]  — success; caller writes each back into exon_seqs.
+                                           One entry per kept span the variant overlaps, so more
+                                           than one when an equal-length substitution is clipped
+                                           into several spans.
         "reference mismatch"             — `ref` doesn't match the genome.
         "impacts native start or stop site" — variant footprint hits the 6 bp of
                                              the start codon or stop codon.
-        "variant straddles splice boundary" — footprint partially overlaps a
-                                             kept span (indels only). Caller skips.
+        "variant straddles splice boundary" — footprint partially overlaps a kept span and
+                                             cannot be clipped to it: indels only, since
+                                             without a 1:1 base mapping nothing determines how
+                                             many inserted bases fall inside the span. An
+                                             equal-length substitution is instead clipped into
+                                             every kept span it overlaps, abutting or not.
         "cannot determine"               — footprint is entirely outside every
                                              kept span (variant in a non-retained
                                              intron). Caller proceeds with the
@@ -1777,16 +1784,44 @@ def _apply_variant_to_altered_exon_seqs(altered_exon_spans, exon_seqs, var_pos, 
 
     # Find a kept span that fully contains the variant footprint.
     fully_contained_idx = None
-    partial_overlap = False
+    partially_overlapping_idxs = []
     for i, (span_start, span_end) in enumerate(altered_exon_spans):
         if var_pos >= span_start and var_end <= span_end:
             fully_contained_idx = i
             break
         if not (var_end < span_start or var_pos > span_end):
-            partial_overlap = True
+            partially_overlapping_idxs.append(i)
 
     if fully_contained_idx is None:
-        if partial_overlap:
+        # A substitution (len(ref) == len(alt)) maps every ALT base 1:1 onto a genomic
+        # position, so the part of the footprint that lands inside a kept span can be applied
+        # on its own and the part outside can be dropped: it sits in sequence that this
+        # altered transcript splices out, and so cannot reach the protein. Its only effect is
+        # on splicing itself, which is already modelled by the aberration we are translating.
+        # The case this covers is an MNV across a donor that SpliceAI shifts, e.g. the
+        # 2 bp 9-131235320-CA-TG of issue #134, where the variant covers the last exonic base
+        # and the first intronic base and only the exonic base changes the coding sequence.
+        #
+        # Every overlapping span is clipped, not just a single one: whole_intron_retention
+        # inserts the retained intron as its own span directly abutting the flanking exon
+        # (_build_altered_exon_spans), so a variant sitting on that junction -- a splice-site
+        # variant, exactly the kind that causes intron retention -- overlaps two kept spans and
+        # would otherwise be skipped for no good reason. Indels still skip: with no 1:1 base
+        # mapping, nothing determines how many inserted bases belong inside the span.
+        if len(ref) == len(alt) and partially_overlapping_idxs:
+            writes = []
+            for overlap_idx in partially_overlapping_idxs:
+                span_start, span_end = altered_exon_spans[overlap_idx]
+                clipped_start = max(var_pos, span_start)
+                clipped_end = min(var_end, span_end)
+                affected_exon = exon_seqs[overlap_idx]
+                offset = clipped_start - span_start
+                writes.append((overlap_idx,
+                               affected_exon[:offset]
+                               + alt[clipped_start - var_pos:clipped_end - var_pos + 1]
+                               + affected_exon[offset + (clipped_end - clipped_start + 1):]))
+            return writes
+        if partially_overlapping_idxs:
             return 'variant straddles splice boundary'
         return 'cannot determine'
 
@@ -1804,8 +1839,8 @@ def _apply_variant_to_altered_exon_seqs(altered_exon_spans, exon_seqs, var_pos, 
 
     affected_exon = exon_seqs[fully_contained_idx]
     adjustment_size = var_pos - span_start
-    adjusted = affected_exon[:adjustment_size] + alt + affected_exon[adjustment_size + len(ref):]
-    return f'{fully_contained_idx}_{adjusted}'
+    return [(fully_contained_idx,
+             affected_exon[:adjustment_size] + alt + affected_exon[adjustment_size + len(ref):])]
 
 
 def _consensus_filtered_in_tx_order(transcript_scores):
@@ -2161,10 +2196,11 @@ def _translate_spans(spans, first_eframe, fasta, chrom, strand, apply_variant_ar
         if result in ('reference mismatch', 'impacts native start or stop site',
                       'variant straddles splice boundary'):
             return result
+        # 'cannot determine' (the variant lies outside every kept span) leaves the sequences
+        # untouched; anything else is the list of writes to apply.
         if result != 'cannot determine':
-            parts = result.split('_', 1)
-            if len(parts) == 2:
-                exon_seqs[int(parts[0])] = parts[1]
+            for exon_idx, modified_seq in result:
+                exon_seqs[exon_idx] = modified_seq
 
     if strand == '-':
         exon_seqs = [_reverse_complement(s) for s in exon_seqs]

@@ -170,7 +170,7 @@ or to get Pangolin scores while also setting the `distance` and `mask` parameter
 
 Parameter descriptions:  
 
-- **variant** (required) a variant in the format "chrom-pos-ref-alt"  
+- **variant** (required) a variant in the format "chrom-pos-ref-alt". Bases that REF and ALT share are trimmed off before scoring, so `chr1-55057513-TG-TA` is scored as `1-55057514-G-A`. The response echoes the requested variant in `variant`, while its `pos`, `ref` and `alt` give the spelling that was scored, which the delta score positions are measured from.  
 - **hg** (required) can be 37 or 38  
 - **distance** (optional) distance parameter of SpliceAI model (default: 50)   
 - **mask** (optional) can be 0 which means raw scores or 1 which means masked scores (default: 0). 
@@ -193,6 +193,7 @@ docker run -p 8080:8080 docker.io/weisburd/pangolin-37:latest
 On startup the container loads the model and prints some TensorFlow / model-loading warnings (e.g. `WARNING:absl:No training configuration found...`); these can be ignored. Once it is listening on port 8080, you can query it. For example, if you started the `spliceai-38` image, you can open http://localhost:8080/spliceai/?hg=38&variant=chr8-140300616-T-G in your browser. Each per-genome/per-tool image only answers requests for its own tool and `hg` value. 
 
 Optional environment variables (pass with `docker run -e NAME=value ...`):
+- `GENE_SET=basic` / `comprehensive` — which Gencode gene set the container annotates against. Defaults to `basic`, and each container loads only the one set, so a request whose `bc=` asks for the other one is refused with an explanatory error rather than answered. To query the comprehensive set locally, start the container with `-e GENE_SET=comprehensive` (the image already contains both sets' annotation files, so this needs no different image).
 - `DISABLE_RATE_LIMIT=1` — explicitly turn off per-IP rate limiting. Only relevant if you connect your own database (see below); without a database, rate limiting is already disabled.
 - `DATABASE_ENABLED=1` / `0` — force the database on or off. Defaults to on when `DB_PASSWORD` is set and off otherwise.
 - `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` — connection settings for an optional PostgreSQL database (see below).
@@ -220,12 +221,11 @@ The server creates the tables it needs automatically on the first request (`cach
 
 The `transcripts_hg37`/`transcripts_hg38` tables used for SAI-10k transcript-structure enrichment are *not* created automatically; without them SAI-10k falls back to the bundled annotations. To populate them, see the `update_transcript_tables` command in [build_and_deploy.py](https://github.com/broadinstitute/SpliceAI-lookup/blob/master/google_cloud_run_services/build_and_deploy.py).
 
-If you would like to run your own API instance on Google Cloud instead of locally, see the [build_and_deploy.py](https://github.com/broadinstitute/SpliceAI-lookup/blob/master/google_cloud_run_services/build_and_deploy.py#L224-L238) script which we use to deploy and update the SpliceAI-lookup API on [Google Cloud Run](https://cloud.google.com/run?hl=en). Submit a GitHub issue if you have any questions.
+If you would like to run your own API instance on Google Cloud instead of locally, see the `main()` argument parser in the [build_and_deploy.py](https://github.com/broadinstitute/SpliceAI-lookup/blob/master/google_cloud_run_services/build_and_deploy.py) script, which lists the deploy options, and which we use to deploy and update the SpliceAI-lookup API on [Google Cloud Run](https://cloud.google.com/run?hl=en). Submit a GitHub issue if you have any questions.
 
 ---
-#### Code Overview For Developers
+#### For Developers
 
-The [spliceailookup.broadinstitute.org](https://spliceailookup.broadinstitute.org) front-end is contained within [index.html](index.html). It uses ES6 javascript with [Semantic UI](https://semantic-ui.com) and [jQuery](https://en.wikipedia.org/wiki/JQuery). Also, it uses a [custom version of igv.js](https://github.com/bw2/igv.js) that includes new track types for visualizing the SpliceAI & Pangolin scores. The new server-side code is in the [google_cloud_run_services/](google_cloud_run_services/) subdirectory and includes Dockerfiles for building API server images, as well as the [build_and_deploy.py](https://github.com/broadinstitute/SpliceAI-lookup/blob/master/google_cloud_run_services/build_and_deploy.py#L224-L238) script for deploying SpliceAI and Pangolin API services to [Google Cloud Run](https://cloud.google.com/run?hl=en). 
-The API server logic is in [google_cloud_run_services/server.py](https://github.com/broadinstitute/SpliceAI-lookup/blob/master/google_cloud_run_services/server.py) and uses the [Flask](https://flask.palletsprojects.com/en/3.0.x) library.
+For how to make, test, and/or contribute changes, see [Developer Guidelines](CONTRIBUTING.md).
 
 
