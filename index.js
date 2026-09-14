@@ -390,7 +390,9 @@ const genomeDisplayName = (genomeVersion) => {
     return genomeVersion == '37' ? "hg19" : "hg38"
 }
 
-const GENEBE_API_PREFIX = "https://api.genebe.net/cloud/api-public/v1"
+// Same-origin nginx proxies (see deploy/nginx.conf.example). Avoids Charité CORS/403 to these hosts.
+const GENEBE_API_PREFIX = "/spliceai-lookup/genebe"
+const VARIANTVALIDATOR_API_PREFIX = "/spliceai-lookup/variantvalidator"
 // A bare dbSNP id, which GeneBe's variant-relaxed endpoint accepts but which names a position
 // rather than an allele. See resolveVariantWithGeneBe.
 const RS_ID_RE = /^rs\d+$/i
@@ -399,6 +401,13 @@ const ENSEMBL_TIMEOUT_MS = 90000  // 90 second timeout for Ensembl API calls
 const VARIANTVALIDATOR_TIMEOUT_MS = 30000  // 30 second timeout for the VariantValidator fallback
 // Guidance appended to variant-resolution errors when HGVS lookup is unavailable.
 const GENOMIC_COORDINATE_HINT = `Try entering the variant using genomic coordinates rather than HGVS (eg. "chrom-pos-ref-alt", "chrom:pos ref>alt", etc.)`
+
+const stripProteinHgvsSuffix = (variant) => {
+    /* Drop a trailing protein HGVS annotation so resolvers see nucleotide HGVS only.
+     * e.g. "NM_001089.3(ABCA3):c.875A>T (p.Glu292Val)" → "NM_001089.3(ABCA3):c.875A>T"
+     */
+    return String(variant).replace(/\s*\(p\.[^)]+\)\s*$/i, "").trim()
+}
 
 // Ensembl's VEP consequence ranking, most severe first, as returned by
 // https://rest.ensembl.org/info/variation/consequence_types?rank=1
@@ -627,16 +636,17 @@ const resolveVariantWithGeneBe = async (variant) => {
      * Args:
      *  variant (string): user input text, which is always HGVS notation or a dbSNP id here.
      */
+    const queryVariant = stripProteinHgvsSuffix(variant)
     // No expectedVariant: hg38 answers are checked by GeneBe's own 'warning' field instead of by
     // comparing alleles, for the reason set out in annotateVariantWithGeneBe's comparison.
-    const result = await annotateVariantWithGeneBe(variant.trim(), "38", variant)
+    const result = await annotateVariantWithGeneBe(queryVariant, "38", variant)
 
     // A dbSNP id names a position, not an allele, and GeneBe answers a multi-allelic one with a
     // single ALT of its choosing. Scoring one allele the user never picked is only safe if the page
     // says which one it used, so name it. hg19 doesn't need this: Ensembl rejects rs ids.
-    if (result && result.variant && RS_ID_RE.test(variant.trim())) {
+    if (result && result.variant && RS_ID_RE.test(queryVariant)) {
         result.warnings = [
-            `${variant.trim()} was resolved to ${result.variant}. A dbSNP ID can cover more than `
+            `${queryVariant} was resolved to ${result.variant}. A dbSNP ID can cover more than `
             + `one alternate allele, so if you meant a different one, search for it as `
             + `chrom-pos-ref-alt.`,
         ]
@@ -649,6 +659,7 @@ const resolveVariantWithVariantValidator = async (variant, genomeVersion) => {
      * Converts an HGVS variant to "{chrom}-{pos}-{ref}-{alt}" via the public VariantValidator REST
      * API (no API key required). Returns that string on success, or null if VariantValidator is
      * unreachable or can't resolve the variant. Does NOT provide a VEP consequence. */
+    const queryVariant = stripProteinHgvsSuffix(variant)
     const build = genomeVersion == '37' ? 'GRCh37' : 'GRCh38'
     const buildKey = genomeVersion == '37' ? 'grch37' : 'grch38'
     try {
@@ -656,7 +667,7 @@ const resolveVariantWithVariantValidator = async (variant, genomeVersion) => {
             // Use the 'select' (MANE/RefSeq-select) transcript set rather than 'all':
             // VariantValidator has deprecated select_transcripts='all'/'raw' for genomic (g.) HGVS
             // input, which returns a 404 "Not Found" instead of coordinates.
-            `https://rest.variantvalidator.org/VariantValidator/variantvalidator/${build}/${encodeURIComponent(variant.trim())}/select`,
+            `${VARIANTVALIDATOR_API_PREFIX}/VariantValidator/variantvalidator/${build}/${encodeURIComponent(queryVariant)}/select`,
             VARIANTVALIDATOR_TIMEOUT_MS)
         // The response is keyed by validated variant description(s), alongside "flag" and
         // "metadata" keys; the genomic position lives under primary_assembly_loci[buildKey].vcf.
@@ -668,7 +679,7 @@ const resolveVariantWithVariantValidator = async (variant, genomeVersion) => {
                 return `${String(vcf.chr).replace(/^chr/i, '')}-${vcf.pos}-${vcf.ref}-${vcf.alt}`
             }
         }
-        console.warn("VariantValidator returned no genomic coordinates for", variant, response)
+        console.warn("VariantValidator returned no genomic coordinates for", queryVariant, response)
         return null
     } catch (e) {
         console.warn("VariantValidator fallback failed:", e)
@@ -677,7 +688,9 @@ const resolveVariantWithVariantValidator = async (variant, genomeVersion) => {
 }
 
 const ensemblApiPrefix = (genomeVersion) => (
-    `https://${genomeVersion == '37' ? 'grch37.' : ''}rest.ensembl.org/vep/human/hgvs/`
+    genomeVersion == '37'
+        ? "/spliceai-lookup/ensembl-grch37/vep/human/hgvs/"
+        : "/spliceai-lookup/ensembl/vep/human/hgvs/"
 )
 
 const genomicHgvs = (chrom, pos, ref, alt) => {
@@ -830,8 +843,9 @@ const resolveHgvsWithEnsembl = async (variant, genomeVersion) => {
     /* Convert HGVS notation to "{chrom}-{pos}-{ref}-{alt}" with the Ensembl VEP API.
      * Throws rather than answering null, so the hg19 path can tell the user exactly why the
      * conversion failed. The hg38 race catches that and treats it as one contestant losing. */
+    const queryVariant = stripProteinHgvsSuffix(variant)
     const responseJson = await makeRequest(
-        `${ensemblApiPrefix(genomeVersion)}${variant.trim()}?content-type=application/json&vcf_string=1`,
+        `${ensemblApiPrefix(genomeVersion)}${queryVariant}?content-type=application/json&vcf_string=1`,
         ENSEMBL_TIMEOUT_MS)
     console.log("Ensembl API response:", responseJson)
 

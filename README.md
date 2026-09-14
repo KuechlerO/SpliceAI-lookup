@@ -16,13 +16,16 @@ This fork serves the UI locally and proxies SpliceAI requests to dedicated API c
 #### Architecture
 
 ```
-Browser → nginx (:80)
-            ├─ /spliceai-lookup/          → modified-spliceai-lookup (frontend + Flask shim)
-            ├─ /spliceai-lookup/api/37/   → spliceai-37-api (weisburd/spliceai-37)
-            └─ /spliceai-lookup/api/38/   → spliceai-38-api (weisburd/spliceai-38)
-                                              └─ postgres (transcript tables + cache)
+Browser → nginx (:80 or :443 TLS)
+            ├─ /spliceai-lookup/api/37|38/     → local SpliceAI API containers
+            ├─ /spliceai-lookup/genebe/        → api.genebe.net (CORS bypass)
+            ├─ /spliceai-lookup/ensembl(-grch37)/ → Ensembl REST (CORS bypass)
+            ├─ /spliceai-lookup/variantvalidator/ → VariantValidator (CORS bypass)
+            └─ /spliceai-lookup/               → modified-spliceai-lookup (frontend)
+                                                    └─ postgres (transcript tables + cache)
 ```
 
+GeneBe, Ensembl, and VariantValidator must be reverse-proxied under `/spliceai-lookup/…` with `^~` locations **before** the frontend `location /spliceai-lookup/`. Direct browser calls from a Charité Origin are blocked (403/503 / missing CORS). Paste-ready blocks are in [deploy/nginx.conf.example](deploy/nginx.conf.example); [index.js](index.js) already points at those same-origin paths.
 SAI-10k-calc needs per-transcript **exon and CDS coordinates**. The stock `weisburd` Docker images load those from PostgreSQL (`transcripts_hg37` / `transcripts_hg38`). Without that database, SAI-10k can still classify aberration types using a fallback in [google_cloud_run_services/server.py](google_cloud_run_services/server.py), but frameshift / start-codon labels will show as "non-coding change" because CDS bounds are missing.
 
 #### Docker Compose deployment
@@ -130,6 +133,20 @@ python3 -m http.server 8000
 
 Open http://localhost:8000/index.html. SpliceAI API calls will fail unless nginx/API containers are running and `index.html` points to them.
 
+#### GeneBe / Ensembl proxy (required on Charité)
+
+After updating nginx, reload it (`nginx -s reload` or recreate the nginx container). The nginx host must reach `api.genebe.net`, `rest.ensembl.org`, `grch37.rest.ensembl.org`, and `rest.variantvalidator.org` (set `HTTPS_PROXY` / corporate egress on the nginx service if direct outbound HTTPS is blocked).
+
+On production (e.g. `westhafen.charite.de`), insert the `^~ /spliceai-lookup/genebe/`, `ensembl-grch37/`, `ensembl/`, and `variantvalidator/` blocks from [deploy/nginx.conf.example](deploy/nginx.conf.example) into the **HTTPS** `server` block, above `location /spliceai-lookup/`.
+
+#### Position-only / `/scores` API
+
+hg38 position-only queries (e.g. `chr8:140300616`) and the `/scores/` endpoint need the GeneBe-era [google_cloud_run_services/server.py](google_cloud_run_services/server.py). With the compose bind-mounts, recreate the API containers after pulling:
+
+```bash
+docker compose up -d --force-recreate spliceai-37-api spliceai-38-api
+```
+
 #### Troubleshooting
 
 | Symptom | Likely cause |
@@ -140,6 +157,9 @@ Open http://localhost:8000/index.html. SpliceAI API calls will fail unless nginx
 | `GenePred file not found` | Download sorted genePred files (step 3) — they are not in the `weisburd` images |
 | hg19 IGV errors | Ensure latest [index.js](index.js) is deployed (GRCh37 reference uses `fastaURL`/`indexURL`, not `twoBitURL`) |
 | `POSTGRES_PASSWORD` ignored after change | Volume was initialized with an old password — recreate the `postgres-data` volume |
+| GeneBe/Ensembl CORS 403/503 from browser | nginx missing `^~` GeneBe/Ensembl proxies, or blocks ordered after `/spliceai-lookup/` |
+| HGVS with `(p.…)` fails VariantValidator | Deploy latest [index.js](index.js) (strips protein suffix before resolvers) |
+| Local SpliceAI "Unable to parse variant" on `chrom:pos` | API containers not remounted/recreated with updated `server.py` |
 
 ---
 
