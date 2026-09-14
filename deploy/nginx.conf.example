@@ -59,43 +59,48 @@ http {
             send_timeout 600s;
         }
 
-        # Same-origin proxies for browser APIs that block Charité Origin (CORS / 403 / 503)
+        # Same-origin paths for GeneBe / Ensembl / VariantValidator.
+        # Do NOT proxy_pass these to the public HTTPS hosts from nginx: Charité egress
+        # often blocks that (instant 502), and nginx ignores HTTP(S)_PROXY.
+        # Forward to the Flask app instead; server.py proxies outbound (honours HTTPS_PROXY).
+        # These ^~ blocks are optional if /spliceai-lookup/ already maps to the frontend —
+        # they only ensure the paths are not accidentally routed elsewhere.
         location ^~ /spliceai-lookup/genebe/ {
-            proxy_pass https://api.genebe.net/cloud/api-public/v1/;
-            proxy_ssl_server_name on;
-            proxy_set_header Host api.genebe.net;
-            proxy_set_header Origin "";
-            proxy_set_header Referer "";
+            proxy_pass http://spliceai_frontend/genebe/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
             proxy_connect_timeout 30s;
             proxy_read_timeout 30s;
         }
 
         location ^~ /spliceai-lookup/ensembl-grch37/ {
-            proxy_pass https://grch37.rest.ensembl.org/;
-            proxy_ssl_server_name on;
-            proxy_set_header Host grch37.rest.ensembl.org;
-            proxy_set_header Origin "";
-            proxy_set_header Referer "";
+            proxy_pass http://spliceai_frontend/ensembl-grch37/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
             proxy_connect_timeout 90s;
             proxy_read_timeout 90s;
         }
 
         location ^~ /spliceai-lookup/ensembl/ {
-            proxy_pass https://rest.ensembl.org/;
-            proxy_ssl_server_name on;
-            proxy_set_header Host rest.ensembl.org;
-            proxy_set_header Origin "";
-            proxy_set_header Referer "";
+            proxy_pass http://spliceai_frontend/ensembl/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
             proxy_connect_timeout 90s;
             proxy_read_timeout 90s;
         }
 
         location ^~ /spliceai-lookup/variantvalidator/ {
-            proxy_pass https://rest.variantvalidator.org/;
-            proxy_ssl_server_name on;
-            proxy_set_header Host rest.variantvalidator.org;
-            proxy_set_header Origin "";
-            proxy_set_header Referer "";
+            proxy_pass http://spliceai_frontend/variantvalidator/;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
             proxy_connect_timeout 30s;
             proxy_read_timeout 30s;
         }
