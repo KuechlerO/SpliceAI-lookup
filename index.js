@@ -402,6 +402,15 @@ const VARIANTVALIDATOR_TIMEOUT_MS = 30000  // 30 second timeout for the VariantV
 // Guidance appended to variant-resolution errors when HGVS lookup is unavailable.
 const GENOMIC_COORDINATE_HINT = `Try entering the variant using genomic coordinates rather than HGVS (eg. "chrom-pos-ref-alt", "chrom:pos ref>alt", etc.)`
 
+// From lookup_retry.js (classic script). Transient network/proxy blips are retried; VEP
+// variant rejections and full Ensembl timeouts are not.
+const {
+    isLookupTimeoutError,
+    isTransientLookupError,
+    isTransientHttpFailure,
+    withRetries,
+} = LookupRetry
+
 const stripProteinHgvsSuffix = (variant) => {
     /* Drop a trailing protein HGVS annotation so resolvers see nucleotide HGVS only.
      * e.g. "NM_001089.3(ABCA3):c.875A>T (p.Glu292Val)" → "NM_001089.3(ABCA3):c.875A>T"
@@ -655,36 +664,35 @@ const resolveVariantWithGeneBe = async (variant) => {
 }
 
 const resolveVariantWithVariantValidator = async (variant, genomeVersion) => {
-    /* Fallback coordinate resolver, used only when the Ensembl API is unreachable.
+    /* Fallback coordinate resolver, used when GeneBe/Ensembl could not convert HGVS.
      * Converts an HGVS variant to "{chrom}-{pos}-{ref}-{alt}" via the public VariantValidator REST
-     * API (no API key required). Returns that string on success, or null if VariantValidator is
-     * unreachable or can't resolve the variant. Does NOT provide a VEP consequence. */
+     * API (no API key required). Returns that string on success, or null when VariantValidator
+     * answered but had no genomic coordinates for this notation. Network / proxy failures throw
+     * so the caller can retry. Does NOT provide a VEP consequence. */
     const queryVariant = stripProteinHgvsSuffix(variant)
     const build = genomeVersion == '37' ? 'GRCh37' : 'GRCh38'
     const buildKey = genomeVersion == '37' ? 'grch37' : 'grch38'
-    try {
-        const response = await makeRequest(
-            // Use the 'select' (MANE/RefSeq-select) transcript set rather than 'all':
-            // VariantValidator has deprecated select_transcripts='all'/'raw' for genomic (g.) HGVS
-            // input, which returns a 404 "Not Found" instead of coordinates.
-            `${VARIANTVALIDATOR_API_PREFIX}/VariantValidator/variantvalidator/${build}/${encodeURIComponent(queryVariant)}/select`,
-            VARIANTVALIDATOR_TIMEOUT_MS)
-        // The response is keyed by validated variant description(s), alongside "flag" and
-        // "metadata" keys; the genomic position lives under primary_assembly_loci[buildKey].vcf.
-        for (const key of Object.keys(response)) {
-            if (key === 'flag' || key === 'metadata') continue
-            const loci = response[key] && response[key].primary_assembly_loci
-            const vcf = loci && loci[buildKey] && loci[buildKey].vcf
-            if (vcf && vcf.chr && vcf.pos && vcf.ref && vcf.alt) {
-                return `${String(vcf.chr).replace(/^chr/i, '')}-${vcf.pos}-${vcf.ref}-${vcf.alt}`
-            }
-        }
-        console.warn("VariantValidator returned no genomic coordinates for", queryVariant, response)
-        return null
-    } catch (e) {
-        console.warn("VariantValidator fallback failed:", e)
-        return null
+    const response = await makeRequest(
+        // Use the 'select' (MANE/RefSeq-select) transcript set rather than 'all':
+        // VariantValidator has deprecated select_transcripts='all'/'raw' for genomic (g.) HGVS
+        // input, which returns a 404 "Not Found" instead of coordinates.
+        `${VARIANTVALIDATOR_API_PREFIX}/VariantValidator/variantvalidator/${build}/${encodeURIComponent(queryVariant)}/select`,
+        VARIANTVALIDATOR_TIMEOUT_MS)
+    if (isTransientHttpFailure(response)) {
+        throw Error(response.error || `VariantValidator HTTP ${response.httpStatus}`)
     }
+    // The response is keyed by validated variant description(s), alongside "flag" and
+    // "metadata" keys; the genomic position lives under primary_assembly_loci[buildKey].vcf.
+    for (const key of Object.keys(response)) {
+        if (key === 'flag' || key === 'metadata') continue
+        const loci = response[key] && response[key].primary_assembly_loci
+        const vcf = loci && loci[buildKey] && loci[buildKey].vcf
+        if (vcf && vcf.chr && vcf.pos && vcf.ref && vcf.alt) {
+            return `${String(vcf.chr).replace(/^chr/i, '')}-${vcf.pos}-${vcf.ref}-${vcf.alt}`
+        }
+    }
+    console.warn("VariantValidator returned no genomic coordinates for", queryVariant, response)
+    return null
 }
 
 const ensemblApiPrefix = (genomeVersion) => (
@@ -839,6 +847,18 @@ const ensemblRejection = (message) => {
     return error
 }
 
+const shouldRetryEnsemblConversion = (error) => {
+    /* Retry only fast network/proxy failures. Full timeouts go straight to VariantValidator;
+     * ensemblRejected means VEP ruled on the variant itself. */
+    if (error && error.ensemblRejected) {
+        return false
+    }
+    if (isLookupTimeoutError(error)) {
+        return false
+    }
+    return isTransientLookupError(error)
+}
+
 const resolveHgvsWithEnsembl = async (variant, genomeVersion) => {
     /* Convert HGVS notation to "{chrom}-{pos}-{ref}-{alt}" with the Ensembl VEP API.
      * Throws rather than answering null, so the hg19 path can tell the user exactly why the
@@ -850,7 +870,12 @@ const resolveHgvsWithEnsembl = async (variant, genomeVersion) => {
     console.log("Ensembl API response:", responseJson)
 
     if (!responseJson.ok || responseJson.error) {
-        let errorText = `${responseJson.error}`
+        let errorText = `${responseJson.error || `HTTP ${responseJson.httpStatus}`}`
+        // Flask 502 / nginx / upstream outages must not be marked ensemblRejected, or hg19 would
+        // skip VariantValidator. Only VEP's own variant-level messages are permanent rejections.
+        if (isTransientHttpFailure(responseJson) || isTransientLookupError(Error(errorText))) {
+            throw Error(errorText)
+        }
         const refAlleleErrorMatch = errorText.match(
             new RegExp("[(]([ACGTRYSWKMBDHVN]+)[)] does not match reference allele given by HGVS notation"))
         if (refAlleleErrorMatch) {
@@ -880,6 +905,21 @@ const resolveHgvsWithEnsembl = async (variant, genomeVersion) => {
     }
 }
 
+const resolveHgvsWithEnsemblRetried = (variant, genomeVersion, onProgress = () => {}) => {
+    /* Up to 3 Ensembl attempts on transient network errors. Timeouts and VEP rejections are not
+     * retried (timeouts would stall a batch; rejections won't change on retry). */
+    return withRetries(
+        () => resolveHgvsWithEnsembl(variant, genomeVersion),
+        {
+            attempts: 3,
+            delaysMs: [0, 1000, 2000],
+            shouldRetry: shouldRetryEnsemblConversion,
+            onRetry: (nextAttempt) => {
+                onProgress(`Retrying Ensembl API (attempt ${nextAttempt})...`)
+            },
+        })
+}
+
 const resolveHgvsWithVariantValidator = async (variant, genomeVersion, userInputVariant, onProgress, fallbackReason) => {
     /* Last-resort HGVS conversion, for when the APIs that normally convert it could not.
      *
@@ -888,7 +928,22 @@ const resolveHgvsWithVariantValidator = async (variant, genomeVersion, userInput
      *      couldn't resolve the variant either
      */
     onProgress("Converting HGVS notation to chrom-pos-ref-alt using VariantValidator...")
-    const vvVariant = await resolveVariantWithVariantValidator(variant, genomeVersion)
+    let vvVariant
+    try {
+        vvVariant = await withRetries(
+            () => resolveVariantWithVariantValidator(variant, genomeVersion),
+            {
+                attempts: 2,
+                delaysMs: [0, 1000],
+                shouldRetry: (e) => !isLookupTimeoutError(e) && isTransientLookupError(e),
+                onRetry: () => {
+                    onProgress("Retrying VariantValidator...")
+                },
+            })
+    } catch (e) {
+        console.warn("VariantValidator fallback failed:", e)
+        return null
+    }
     if (!vvVariant) {
         return null
     }
@@ -967,7 +1022,7 @@ const normalizeVariant = async (variant, genomeVersion, onProgress = () => {}) =
             // Tagged so the consequences below can tell whether GeneBe's own answer is already
             // in hand, or whether it still has to be asked about the coordinates Ensembl chose.
             resolveVariantWithGeneBe(variant).then((r) => r && {...r, 'fromGeneBe': true}),
-            resolveHgvsWithEnsembl(variant, genomeVersion).catch((e) => {
+            resolveHgvsWithEnsemblRetried(variant, genomeVersion, onProgress).catch((e) => {
                 console.warn("Ensembl API couldn't convert the HGVS notation:", e)
                 if (e.ensemblRejected) {
                     ensemblRejectionError = e
@@ -1019,11 +1074,12 @@ const normalizeVariant = async (variant, genomeVersion, onProgress = () => {}) =
     }
 
     // hg19: Ensembl resolves the coordinates on its own, and its error text is what the user sees
-    // when it can't, so this one is awaited rather than raced.
+    // when it can't, so this one is awaited rather than raced. Transient network failures are
+    // retried a few times before VariantValidator is tried.
     onProgress("Converting HGVS notation to chrom-pos-ref-alt using the Ensembl API...")
     let resolved
     try {
-        resolved = await resolveHgvsWithEnsembl(variant, genomeVersion)
+        resolved = await resolveHgvsWithEnsemblRetried(variant, genomeVersion, onProgress)
     } catch (e) {
         console.error(e)
         if (e.ensemblRejected) {
@@ -1034,13 +1090,13 @@ const normalizeVariant = async (variant, genomeVersion, onProgress = () => {}) =
         const errorMessage = e.message || e.toString()
         const fallback = await resolveHgvsWithVariantValidator(
             variant, genomeVersion, userInputVariant, onProgress,
-            errorMessage.includes('timed out')
+            isLookupTimeoutError(e)
                 ? 'Ensembl API timed out; converted HGVS to genomic coordinates via VariantValidator'
                 : 'Ensembl API unavailable; converted HGVS to genomic coordinates via VariantValidator')
         if (fallback) {
             return fallback
         }
-        if (errorMessage.includes('timed out')) {
+        if (isLookupTimeoutError(e)) {
             throw Error(`Ensembl API timed out. ${GENOMIC_COORDINATE_HINT}`)
         }
         throw Error(`Ensembl API call failed: ${errorMessage}. ${GENOMIC_COORDINATE_HINT}`)
@@ -1081,19 +1137,20 @@ const makeRequest = (url, timeoutMs = null) => {
                 response = JSON.parse(xhr.response)
             } catch(e) {
                 console.error("Unable to parse response", xhr.response)
-                reject(`Unexpected error: ${url}`)
+                reject(new Error(`Unexpected error: ${url} (HTTP ${xhr.status})`))
                 return
             }
 
             response.ok = xhr.status >= 200 && xhr.status < 300
+            response.httpStatus = xhr.status
             resolve(response)
         })
         xhr.addEventListener("error", () => {
             if (timeoutId) clearTimeout(timeoutId)
             if (xhr.status == 0) {
-                reject("Unable to reach server")
+                reject(new Error("Unable to reach server"))
             } else {
-                reject(`${xhr.status}  ${xhr.statusText}`)
+                reject(new Error(`${xhr.status}  ${xhr.statusText}`))
             }
         })
         xhr.addEventListener("abort", () => {
@@ -3099,6 +3156,9 @@ const displayBatchVariantAtIndex = async (idx) => {
     for (const warning of (entry.warnings || [])) {
         showNote(`Note: ${warning}`)
     }
+    if (entry.fallbackReason) {
+        showNote(`Note: ${entry.fallbackReason}`)
+    }
 
     lastSpliceaiResponseJson = entry.spliceaiJson
     lastPangolinResponseJson = entry.pangolinJson
@@ -3225,6 +3285,7 @@ const runBatchVariantSubmit = async (variants, formOptions) => {
                 const norm = await normalizeVariant(rawVariant, formOptions.genomeVersion)
                 entry.normalizedVariant = norm.variant
                 entry.warnings = norm.warnings || null
+                entry.fallbackReason = norm.fallbackReason || null
                 // Still running: the scoring requests below don't need it, so it is awaited after
                 // they have been sent rather than before.
                 consequencesPromise = norm.consequencesPromise
@@ -3313,6 +3374,9 @@ const runSingleVariantSubmit = async (variant, formOptions) => {
         // Notes about how the input was interpreted, eg. which allele a dbSNP id resolved to
         for (const warning of ((resolvedVariant && resolvedVariant.warnings) || [])) {
             showNote(`Note: ${warning}`)
+        }
+        if (resolvedVariant && resolvedVariant.fallbackReason) {
+            showNote(`Note: ${resolvedVariant.fallbackReason}`)
         }
 
         // The consequence isn't sent with these requests: the backends have no use for it, and on

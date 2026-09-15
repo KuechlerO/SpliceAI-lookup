@@ -242,6 +242,10 @@
                 <div>
                     <a href="https://github.com/broadinstitute/SpliceAI-lookup/issues" target="_blank">SpliceAI-lookup/issues</a>: issues or feature requests for this website<br />
                     <br/>
+                    <b>September, 2026</b>
+                    <br />
+                    - HGVS conversion now retries briefly when the Ensembl API is unreachable (common cause of intermittent hg19 batch failures), and still falls back to VariantValidator.<br/>
+                    <br />
                     <b>August, 2026</b>
                     <br />
                     - Switched to the <a href="https://genebe.net" target="_blank">GeneBe API</a> for faster variant consequence lookup on both hg19 and hg38 as well as HGVS conversion on hg38, while still using <a href="https://useast.ensembl.org/info/docs/tools/vep/index.html" target="_blank">Ensembl VEP API</a> for HGVS on hg19.<br/>
@@ -609,6 +613,7 @@
     <div id="per-position-modal-content" class="scrolling content"></div>
 </div>
 
+<script type="text/javascript" src="lookup_retry.js"></script>
 <script type="text/javascript" src="index.js"></script>
 </body>
 </html>
